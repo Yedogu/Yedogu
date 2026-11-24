@@ -1,0 +1,47 @@
+{
+  "name": "yedogu",
+  "version": "1.0.0",
+  "description": "YEDOGU — Terminal-first, browser-extensible (/browser) multi-provider AI harness purpose-built for hackers, red teamers, bug bounty hunters, and reverse engineers.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "bin": {
+    "yedogu": "./bin/yedogu.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json && node ./bin/yedogu.js",
+    "start": "node ./bin/yedogu.js",
+    "test": "tsc -p tsconfig.json && node --test dist/tests/smoke.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "security",
+    "hacking",
+    "red-team",
+    "bug-bounty",
+    "reverse-engineering",
+    "ai-harness",
+    "pentest",
+    "agents",
+    "mcp"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  },
+  "dependencies": {
+    "@webtui/css": "^0.1.10",
+    "@webtui/plugin-declarative-layout": "^0.0.1",
+    "@webtui/plugin-nf": "^0.1.2",
+    "@webtui/theme-catppuccin": "^0.0.5",
+    "@webtui/theme-everforest": "^0.0.5",
+    "@webtui/theme-gruvbox": "^0.0.3",
+    "@webtui/theme-nord": "^0.0.4",
+    "@webtui/theme-osmium": "^0.0.1",
+    "@webtui/theme-vitesse": "^0.0.3"
+  }
+}
