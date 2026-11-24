@@ -26,6 +26,7 @@ export interface GlobalConfig {
   reasoningEffort?: ReasoningEffort;
   defaultAgent: string;
   agentModels: Record<string, string>;
+  favoriteModels?: string[];
   credentials: StoredCredentials;
   customProviders: ProviderConfig[];
   customAgents: AgentDefinition[];
@@ -60,6 +61,7 @@ export function defaultGlobalConfig(): GlobalConfig {
     reasoningEffort: "medium",
     defaultAgent: "commander",
     agentModels: {},
+    favoriteModels: [],
     credentials: {},
     customProviders: [],
     customAgents: [],
@@ -89,6 +91,7 @@ export function loadGlobalConfig(): GlobalConfig {
     ...defaults,
     ...existing,
     agentModels: { ...defaults.agentModels, ...(existing.agentModels ?? {}) },
+    favoriteModels: Array.isArray(existing.favoriteModels) ? existing.favoriteModels : [],
     credentials: { ...(existing.credentials ?? {}) },
     customProviders: existing.customProviders ?? [],
     customAgents: existing.customAgents ?? [],

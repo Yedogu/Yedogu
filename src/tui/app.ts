@@ -14,8 +14,10 @@ import { formatFriendlyError } from "../providers/errors.js";
 import {
   formatModelDisplayName,
   groupModelsForPicker,
+  inferReasoningLevels,
   isProviderConnected,
   probeAgyModels,
+  probeCustomEndpointModels,
   type GroupedModelEntry,
 } from "../providers/registry.js";
 import type { ChannelPublicView, ChatMessage, HarnessEvent, ProviderConfig, ProviderProtocol, ReasoningEffort } from "../types.js";
@@ -78,6 +80,7 @@ import {
   type InputOutcome,
   type ModalOutcome,
   type SelectModalConfig,
+  type SelectModalPatch,
   type SelectOption,
 } from "./popup.js";
 import {
@@ -172,10 +175,28 @@ export class YedoguTui {
   private spinnerFrame = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | null = null;
   private popoverIndex = 0;
+  private popoverScrollTop = 0;
   private popoverDismissedFor: string | null = null;
   private focusArea: "prompt" | "chat" = "prompt";
   private chatScrollbarGeo: { col: number; topRow: number; height: number; totalLines: number } | null = null;
-  private modalScrollbarGeo: { col: number; topRow: number; height: number; totalItems: number; onScrub: (idx: number) => void } | null = null;
+  private modalScrollbarGeo: {
+    col: number;
+    topRow: number;
+    height: number;
+    maxScrollTop: number;
+    onScrub: (nextScrollTop: number) => void;
+  } | null = null;
+  private modalHitGeo: {
+    topRow: number;
+    leftCol: number;
+    width: number;
+    height: number;
+    optionRows: Map<number, number>;
+    onClickOption?: (optionIndex: number) => void;
+    onWheel?: (dir: "up" | "down") => void;
+    onCancel?: () => void;
+  } | null = null;
+  private pendingModalClickIndex: number | null = null;
   private draggingScrollbar: "chat" | "modal" | null = null;
   private mouseEnabled = true;
   private textSelection: {
@@ -195,8 +216,12 @@ export class YedoguTui {
     cursorCol?: number;
     scrollbarRowOffset?: number;
     scrollbarHeight?: number;
-    totalItems?: number;
-    onScrub?: (idx: number) => void;
+    maxScrollTop?: number;
+    optionRowOffsets?: Array<{ rowOffset: number; optionIndex: number }>;
+    onScrub?: (nextScrollTop: number) => void;
+    onWheel?: (dir: "up" | "down") => void;
+    onClickOption?: (optionIndex: number) => void;
+    onCancel?: () => void;
   }) | null = null;
   private overlayKeyHandler: ((str: string, key: readline.Key) => void) | null = null;
   private keypressListener: ((str: string, key: readline.Key) => void) | null = null;
@@ -436,6 +461,76 @@ export class YedoguTui {
     let cursor: { row: number; col: number } | undefined;
     this.chatScrollbarGeo = null;
     this.modalScrollbarGeo = null;
+    this.modalHitGeo = null;
+
+    const applyPopoverSelection = (pop: NonNullable<ReturnType<YedoguTui["getPopoverState"]>>, idx: number) => {
+      const chosen = pop.items[Math.max(0, Math.min(idx, pop.items.length - 1))];
+      if (!chosen) return;
+      if (!chosen.isSlash) {
+        this.inputBuffer = chosen.insert;
+        this.inputCursor = this.inputBuffer.length;
+        this.popoverDismissedFor = this.inputBuffer;
+        this.render();
+        return;
+      }
+      if (chosen.takesArgs && !chosen.interactivePopup && this.inputBuffer !== chosen.label) {
+        this.inputBuffer = `${chosen.label} `;
+        this.inputCursor = this.inputBuffer.length;
+        this.render();
+        return;
+      }
+      this.inputBuffer = "";
+      this.inputCursor = 0;
+      this.popoverIndex = 0;
+      this.popoverScrollTop = 0;
+      this.popoverDismissedFor = null;
+      this.screenMode = "session";
+      this.render();
+      void this.executeSubmittedLine(chosen.label).then(() => this.render());
+    };
+
+    const registerPopoverGeo = (
+      pop: NonNullable<ReturnType<YedoguTui["getPopoverState"]>>,
+      popModal: ReturnType<typeof renderOpenCodeModal>,
+      popTop: number,
+      popLeft: number,
+      popW: number,
+    ) => {
+      this.popoverScrollTop = popModal.scrollTop;
+      const optionRows = new Map<number, number>();
+      for (const entry of popModal.optionRowOffsets) {
+        optionRows.set(popTop + entry.rowOffset + 1, entry.optionIndex);
+      }
+      this.modalHitGeo = {
+        topRow: popTop + 1,
+        leftCol: popLeft + 1,
+        width: popW,
+        height: popModal.lines.length,
+        optionRows,
+        onClickOption: (optIdx: number) => applyPopoverSelection(pop, optIdx),
+        onWheel: (dir: "up" | "down") => {
+          const delta = dir === "up" ? -3 : 3;
+          this.popoverScrollTop = Math.max(0, Math.min(popModal.maxScrollTop, this.popoverScrollTop + delta));
+          this.render();
+        },
+        onCancel: () => {
+          this.popoverDismissedFor = this.inputBuffer;
+          this.render();
+        },
+      };
+      if (popModal.scrollbarRowOffset !== undefined && popModal.scrollbarHeight && popModal.maxScrollTop > 0) {
+        this.modalScrollbarGeo = {
+          col: popLeft + popW - 1,
+          topRow: popTop + popModal.scrollbarRowOffset + 1,
+          height: popModal.scrollbarHeight,
+          maxScrollTop: popModal.maxScrollTop,
+          onScrub: (nextTop: number) => {
+            this.popoverScrollTop = Math.max(0, Math.min(popModal.maxScrollTop, nextTop));
+            this.render();
+          },
+        };
+      }
+    };
 
     if (this.screenMode === "home") {
       const promptW = Math.min(75, Math.max(38, cols - 4));
@@ -511,9 +606,14 @@ export class YedoguTui {
             badge: it.badge,
           })),
           selectedIndex: popIdx,
+          scrollTop: this.popoverScrollTop,
         });
-        const spliced = compositeOverlay(baseRows, popModal.lines, subRow + 1, promptLeft, promptW, cols);
+        const popTop = subRow + 1;
+        const spliced = compositeOverlay(baseRows, popModal.lines, popTop, promptLeft, promptW, cols);
         for (let r = 0; r < rows; r++) baseRows[r] = spliced[r];
+        if (!this.overlayRender) {
+          registerPopoverGeo(popover, popModal, popTop, promptLeft, promptW);
+        }
       }
     } else {
       // Session screen (chat viewport + bottom composer + optional 40-col sidebar)
@@ -617,9 +717,10 @@ export class YedoguTui {
 
       if (popover && popover.items.length > 0) {
         const popIdx = Math.max(0, Math.min(this.popoverIndex, popover.items.length - 1));
+        const popW = Math.min(promptW, 72);
         const popModal = renderOpenCodeModal({
           title: popover.mode === "mention" ? "Route to Agent or File" : "Commands",
-          width: Math.min(promptW, 72),
+          width: popW,
           maxRows: Math.max(4, Math.min(8, promptTop - 2)),
           searchable: false,
           options: popover.items.map((it) => ({
@@ -629,10 +730,14 @@ export class YedoguTui {
             badge: it.badge,
           })),
           selectedIndex: popIdx,
+          scrollTop: this.popoverScrollTop,
         });
         const popTop = Math.max(1, promptTop - popModal.lines.length);
-        const spliced = compositeOverlay(baseRows, popModal.lines, popTop, promptLeft, Math.min(promptW, 72), cols);
+        const spliced = compositeOverlay(baseRows, popModal.lines, popTop, promptLeft, popW, cols);
         for (let r = 0; r < rows; r++) baseRows[r] = spliced[r];
+        if (!this.overlayRender) {
+          registerPopoverGeo(popover, popModal, popTop, promptLeft, popW);
+        }
       }
     }
 
@@ -648,12 +753,28 @@ export class YedoguTui {
       } else {
         cursor = undefined;
       }
-      if (ov.scrollbarRowOffset !== undefined && ov.scrollbarHeight && ov.totalItems && ov.onScrub) {
+      const optionRows = new Map<number, number>();
+      if (ov.optionRowOffsets) {
+        for (const entry of ov.optionRowOffsets) {
+          optionRows.set(topRow + entry.rowOffset + 1, entry.optionIndex);
+        }
+      }
+      this.modalHitGeo = {
+        topRow: topRow + 1,
+        leftCol: leftCol + 1,
+        width: ov.width,
+        height: ov.lines.length,
+        optionRows,
+        onClickOption: ov.onClickOption,
+        onWheel: ov.onWheel,
+        onCancel: ov.onCancel,
+      };
+      if (ov.scrollbarRowOffset !== undefined && ov.scrollbarHeight && ov.onScrub) {
         this.modalScrollbarGeo = {
           col: leftCol + ov.width - 1, // 1-indexed column of modal scrollbar
           topRow: topRow + ov.scrollbarRowOffset + 1,
           height: ov.scrollbarHeight,
-          totalItems: ov.totalItems,
+          maxScrollTop: ov.maxScrollTop ?? 0,
           onScrub: ov.onScrub,
         };
       }
@@ -876,6 +997,23 @@ export class YedoguTui {
           }
           break;
         }
+        case "model.changed":
+        case "agent.changed":
+        case "provider.updated":
+        case "channel.updated":
+        case "scope.updated":
+        case "session.updated": {
+          if (evt.type === "session.updated") {
+            const payload = evt.payload as { theme?: string } | undefined;
+            if (payload?.theme) {
+              setActiveTheme(payload.theme);
+            }
+          }
+          if (this.fullScreenActive && !this.overlayRender) {
+            this.render();
+          }
+          break;
+        }
       }
     });
   }
@@ -1005,7 +1143,18 @@ export class YedoguTui {
       return;
     }
     if (ev.kind === "up") {
-      this.draggingScrollbar = null;
+      if (this.draggingScrollbar) {
+        this.draggingScrollbar = null;
+        return;
+      }
+      if (this.pendingModalClickIndex !== null) {
+        const clickedIdx = this.pendingModalClickIndex;
+        this.pendingModalClickIndex = null;
+        if (this.modalHitGeo?.optionRows.get(ev.row) === clickedIdx) {
+          this.modalHitGeo.onClickOption?.(clickedIdx);
+        }
+        return;
+      }
       if (this.textSelection?.dragging) {
         this.textSelection.dragging = false;
         const dragged =
@@ -1030,10 +1179,10 @@ export class YedoguTui {
 
     const scrubModal = (row: number) => {
       const geo = this.modalScrollbarGeo;
-      if (!geo || geo.totalItems <= 1) return;
+      if (!geo || geo.maxScrollTop <= 0) return;
       const ratio = Math.max(0, Math.min(1, (row - geo.topRow) / Math.max(1, geo.height - 1)));
-      const idx = Math.round(ratio * (geo.totalItems - 1));
-      geo.onScrub(idx);
+      const nextScrollTop = Math.round(ratio * geo.maxScrollTop);
+      geo.onScrub(nextScrollTop);
     };
 
     const scrubChat = (row: number) => {
@@ -1048,6 +1197,8 @@ export class YedoguTui {
 
     if (ev.kind === "down") {
       this.textSelection = null;
+      this.pendingModalClickIndex = null;
+      // 1. Right-edge scrollbar grab & drag (for modals & popovers)
       if (this.modalScrollbarGeo) {
         const g = this.modalScrollbarGeo;
         if (Math.abs(ev.col - g.col) <= 2 && ev.row >= g.topRow && ev.row < g.topRow + g.height) {
@@ -1056,6 +1207,35 @@ export class YedoguTui {
           return;
         }
       }
+      // 2. Click inside or outside a modal / popover
+      if (this.modalHitGeo) {
+        const m = this.modalHitGeo;
+        const insideModal =
+          ev.col >= m.leftCol &&
+          ev.col < m.leftCol + m.width &&
+          ev.row >= m.topRow &&
+          ev.row < m.topRow + m.height;
+        if (insideModal) {
+          // Clicking `esc` in the top-right header cancels the modal
+          if (ev.row === m.topRow + 1 && ev.col >= m.leftCol + m.width - 6) {
+            m.onCancel?.();
+            return;
+          }
+          const optIdx = m.optionRows.get(ev.row);
+          if (optIdx !== undefined) {
+            this.pendingModalClickIndex = optIdx;
+            return;
+          }
+          // Click on modal chrome (title/search/category/footer): consume without text selection
+          return;
+        }
+        if (this.overlayRender) {
+          // Click outside floating overlay modal dismisses it cleanly
+          m.onCancel?.();
+          return;
+        }
+      }
+      // 3. Chat scrollbar grab & drag in session view
       if (!this.overlayRender && this.chatScrollbarGeo && this.screenMode === "session") {
         const g = this.chatScrollbarGeo;
         if (Math.abs(ev.col - g.col) <= 2 && ev.row >= g.topRow && ev.row < g.topRow + g.height) {
@@ -1079,6 +1259,8 @@ export class YedoguTui {
         scrubModal(ev.row);
       } else if (this.draggingScrollbar === "chat") {
         scrubChat(ev.row);
+      } else if (this.pendingModalClickIndex !== null) {
+        // Ignore drag while pressing an option row; release only fires if still on same row
       } else if (this.textSelection?.dragging) {
         this.textSelection.endRow = Math.max(0, ev.row - 1);
         this.textSelection.endCol = Math.max(0, ev.col - 1);
@@ -1089,15 +1271,12 @@ export class YedoguTui {
 
   private handleMouseWheel(dir: "up" | "down"): void {
     if (!this.fullScreenActive) return;
-    if (this.overlayKeyHandler) {
-      this.overlayKeyHandler("", { name: dir });
+    // Scroll active modal or popover viewport WITHOUT moving selection
+    if (this.modalHitGeo?.onWheel) {
+      this.modalHitGeo.onWheel(dir);
       return;
     }
-    const pop = this.getPopoverState();
-    if (pop && pop.items.length > 0) {
-      const delta = dir === "up" ? -1 : 1;
-      this.popoverIndex = (this.popoverIndex + delta + pop.items.length) % pop.items.length;
-      this.render();
+    if (this.overlayRender) {
       return;
     }
     if (this.screenMode === "session") {
@@ -1257,13 +1436,23 @@ export class YedoguTui {
     // 6. Active `/` or `@` popover navigation
     const pop = this.getPopoverState();
     if (pop && pop.items.length > 0) {
+      const keepPopInView = () => {
+        const viewRows = 8;
+        if (this.popoverIndex < this.popoverScrollTop) {
+          this.popoverScrollTop = this.popoverIndex;
+        } else if (this.popoverIndex >= this.popoverScrollTop + viewRows) {
+          this.popoverScrollTop = Math.max(0, this.popoverIndex - viewRows + 1);
+        }
+      };
       if (key.name === "up") {
         this.popoverIndex = (this.popoverIndex - 1 + pop.items.length) % pop.items.length;
+        keepPopInView();
         this.render();
         return;
       }
       if (key.name === "down") {
         this.popoverIndex = (this.popoverIndex + 1) % pop.items.length;
+        keepPopInView();
         this.render();
         return;
       }
@@ -1321,6 +1510,7 @@ export class YedoguTui {
       this.inputBuffer = "";
       this.inputCursor = 0;
       this.popoverIndex = 0;
+      this.popoverScrollTop = 0;
       this.popoverDismissedFor = null;
       this.historyIndex = -1;
       this.historyDraft = "";
@@ -1352,6 +1542,7 @@ export class YedoguTui {
           this.inputBuffer.slice(this.inputCursor);
         this.inputCursor--;
         this.popoverIndex = 0;
+        this.popoverScrollTop = 0;
         this.render();
       }
       return;
@@ -1456,6 +1647,7 @@ export class YedoguTui {
         this.inputBuffer.slice(this.inputCursor);
       this.inputCursor += str.length;
       this.popoverIndex = 0;
+      this.popoverScrollTop = 0;
       this.render();
     }
   }
@@ -1620,6 +1812,9 @@ export class YedoguTui {
           config.initialIndex !== undefined && config.initialIndex >= 0 && config.initialIndex < filtered.length
             ? config.initialIndex
             : Math.max(0, filtered.findIndex((o) => o.active));
+        let scrollTop = 0;
+        let keepSelectionInView = true;
+        let lastMaxScrollTop = 0;
         let subtitle = config.subtitle ?? "";
         let footerHint =
           config.footerHints ??
@@ -1628,14 +1823,36 @@ export class YedoguTui {
         const applyFilter = () => {
           filtered = filterSelectOptions(options, query);
           if (selectedIndex >= filtered.length) selectedIndex = 0;
+          scrollTop = 0;
+          keepSelectionInView = true;
           config.onHover?.(filtered[selectedIndex]);
         };
 
         const closeOverlay = (outcome: ModalOutcome<T>) => {
           this.overlayRender = null;
           this.overlayKeyHandler = null;
+          this.pendingModalClickIndex = null;
           this.render();
           resolve(outcome);
+        };
+
+        const applyPatch = (patch: SelectModalPatch<T>) => {
+          if (patch.closeWith) {
+            closeOverlay(patch.closeWith);
+            return true;
+          }
+          if (patch.subtitle !== undefined) subtitle = patch.subtitle;
+          if (patch.footerHints !== undefined) footerHint = patch.footerHints;
+          if (patch.options) {
+            options = [...patch.options];
+            applyFilter();
+          }
+          if (patch.selectedIndex !== undefined && filtered.length > 0) {
+            selectedIndex = Math.max(0, Math.min(filtered.length - 1, patch.selectedIndex));
+            keepSelectionInView = true;
+            config.onHover?.(filtered[selectedIndex]);
+          }
+          return false;
         };
 
         this.overlayRender = () => {
@@ -1656,18 +1873,48 @@ export class YedoguTui {
             category: o.category,
             keywords: o.keywords,
           }));
-          const rendered = renderOpenCodeModal({
+          const maxRows = Math.max(4, Math.min(config.maxVisible ?? 12, rows - 10));
+          let rendered = renderOpenCodeModal({
             title: subtitle ? `${config.title} · ${subtitle}` : config.title,
             width: modalW,
-            maxRows: Math.max(4, Math.min(config.maxVisible ?? 12, rows - 10)),
+            maxRows,
             searchable: config.searchable !== false,
             searchPlaceholder: config.placeholder ?? "Search",
             query,
             options: modalOpts,
             selectedIndex,
+            scrollTop,
             footerPanel,
             footerHint,
           });
+          if (keepSelectionInView && rendered.scrollbarHeight) {
+            const viewH = rendered.scrollbarHeight;
+            let desiredScroll = rendered.scrollTop;
+            if (rendered.selectedVisualRow < desiredScroll) {
+              desiredScroll = rendered.selectedVisualRow;
+            } else if (rendered.selectedVisualRow >= desiredScroll + viewH) {
+              desiredScroll = rendered.selectedVisualRow - viewH + 1;
+            }
+            desiredScroll = Math.max(0, Math.min(rendered.maxScrollTop, desiredScroll));
+            if (desiredScroll !== rendered.scrollTop) {
+              scrollTop = desiredScroll;
+              rendered = renderOpenCodeModal({
+                title: subtitle ? `${config.title} · ${subtitle}` : config.title,
+                width: modalW,
+                maxRows,
+                searchable: config.searchable !== false,
+                searchPlaceholder: config.placeholder ?? "Search",
+                query,
+                options: modalOpts,
+                selectedIndex,
+                scrollTop,
+                footerPanel,
+                footerHint,
+              });
+            }
+          }
+          scrollTop = rendered.scrollTop;
+          lastMaxScrollTop = rendered.maxScrollTop;
           return {
             lines: rendered.lines,
             width: modalW,
@@ -1675,11 +1922,28 @@ export class YedoguTui {
             cursorCol: rendered.cursorColOffset,
             scrollbarRowOffset: rendered.scrollbarRowOffset,
             scrollbarHeight: rendered.scrollbarHeight,
-            totalItems: filtered.length,
-            onScrub: (idx: number) => {
-              selectedIndex = Math.max(0, Math.min(filtered.length - 1, idx));
-              config.onHover?.(filtered[selectedIndex]);
+            maxScrollTop: rendered.maxScrollTop,
+            optionRowOffsets: rendered.optionRowOffsets,
+            onScrub: (nextTop: number) => {
+              keepSelectionInView = false;
+              scrollTop = Math.max(0, Math.min(lastMaxScrollTop, nextTop));
               this.render();
+            },
+            onWheel: (dir: "up" | "down") => {
+              keepSelectionInView = false;
+              const delta = dir === "up" ? -3 : 3;
+              scrollTop = Math.max(0, Math.min(lastMaxScrollTop, scrollTop + delta));
+              this.render();
+            },
+            onClickOption: (optIdx: number) => {
+              const chosen = filtered[optIdx];
+              if (!chosen) return;
+              selectedIndex = optIdx;
+              config.onHover?.(chosen);
+              closeOverlay({ action: "select", value: chosen.value, option: chosen });
+            },
+            onCancel: () => {
+              closeOverlay({ action: "cancel" });
             },
           };
         };
@@ -1698,6 +1962,7 @@ export class YedoguTui {
           if (key.name === "up" || (key.ctrl && key.name === "p")) {
             if (filtered.length > 0) {
               selectedIndex = (selectedIndex - 1 + filtered.length) % filtered.length;
+              keepSelectionInView = true;
               config.onHover?.(filtered[selectedIndex]);
               this.render();
             }
@@ -1706,6 +1971,7 @@ export class YedoguTui {
           if (key.name === "down" || (key.ctrl && key.name === "n")) {
             if (filtered.length > 0) {
               selectedIndex = (selectedIndex + 1) % filtered.length;
+              keepSelectionInView = true;
               config.onHover?.(filtered[selectedIndex]);
               this.render();
             }
@@ -1714,6 +1980,7 @@ export class YedoguTui {
           if (key.name === "pageup") {
             if (filtered.length > 0) {
               selectedIndex = Math.max(0, selectedIndex - 6);
+              keepSelectionInView = true;
               config.onHover?.(filtered[selectedIndex]);
               this.render();
             }
@@ -1722,33 +1989,37 @@ export class YedoguTui {
           if (key.name === "pagedown") {
             if (filtered.length > 0) {
               selectedIndex = Math.min(filtered.length - 1, selectedIndex + 6);
+              keepSelectionInView = true;
               config.onHover?.(filtered[selectedIndex]);
               this.render();
             }
             return;
           }
           if (key.name === "left" && config.onLeftRight) {
-            config.onLeftRight(-1, filtered[selectedIndex]);
+            const patch = config.onLeftRight(-1, filtered[selectedIndex]);
+            if (patch && applyPatch(patch)) return;
             this.render();
             return;
           }
           if (key.name === "right" && config.onLeftRight) {
-            config.onLeftRight(1, filtered[selectedIndex]);
+            const patch = config.onLeftRight(1, filtered[selectedIndex]);
+            if (patch && applyPatch(patch)) return;
             this.render();
             return;
           }
           if (key.name === "tab" && config.onTab) {
             const patch = config.onTab();
-            if (patch) {
-              if (patch.subtitle !== undefined) subtitle = patch.subtitle;
-              if (patch.footerHints !== undefined) footerHint = patch.footerHints;
-              if (patch.options) {
-                options = [...patch.options];
-                applyFilter();
-              }
-            }
+            if (patch && applyPatch(patch)) return;
             this.render();
             return;
+          }
+          if (config.onKey) {
+            const handled = config.onKey(str, key, filtered[selectedIndex]);
+            if (handled) {
+              if (typeof handled === "object" && applyPatch(handled)) return;
+              this.render();
+              return;
+            }
           }
           if (config.searchable === false) return;
           if (key.name === "backspace") {
@@ -1846,7 +2117,7 @@ export class YedoguTui {
           lines.push(paintSurfaceLine("", modalW, modalBg));
           lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, config.footerHints ?? "enter submit · esc cancel")}`, modalW, modalBg));
           lines.push(paintSurfaceLine("", modalW, modalBg));
-          return { lines, width: modalW, cursorRow, cursorCol };
+          return { lines, width: modalW, cursorRow, cursorCol, onCancel: () => closeOverlay({ action: "cancel" }) };
         };
 
         this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
@@ -1966,7 +2237,7 @@ export class YedoguTui {
           lines.push(paintSurfaceLine("", modalW, modalBg));
           lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, config.footerHints ?? "tab/↑↓ switch field · enter next/submit · esc cancel")}`, modalW, modalBg));
           lines.push(paintSurfaceLine("", modalW, modalBg));
-          return { lines, width: modalW, cursorRow, cursorCol };
+          return { lines, width: modalW, cursorRow, cursorCol, onCancel: () => closeOverlay({ action: "cancel" }) };
         };
 
         this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
@@ -2075,9 +2346,15 @@ export class YedoguTui {
             ],
             selectedIndex,
             footerPanel: [c(PALETTE.secondary, config.message)],
-            footerHint: "↑↓/←→ choose · enter confirm · esc cancel",
+            footerHint: "↑↓/←→ choose · enter/click confirm · esc cancel",
           });
-          return { lines: rendered.lines, width: modalW };
+          return {
+            lines: rendered.lines,
+            width: modalW,
+            optionRowOffsets: rendered.optionRowOffsets,
+            onClickOption: (optIdx: number) => closeOverlay(optIdx === 1),
+            onCancel: () => closeOverlay(false),
+          };
         };
 
         this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
@@ -2708,12 +2985,37 @@ export class YedoguTui {
     this.emitOut(`\n  ${c(PALETTE.success, "✓")} Reasoning effort → ${c(PALETTE.reasoning + PALETTE.bold, applied)}\n`);
   }
 
-  private async openModelPicker(): Promise<void> {
+  private async openModelPicker(initialProviderFilter = "all"): Promise<void> {
     const activeAgent = this.engine.session.activeAgent;
     let pinToAgent = false;
+    let providerFilter = initialProviderFilter;
+
+    const runRefreshWithSpinner = async (label: string): Promise<void> => {
+      if (this.fullScreenActive) {
+        this.startSpinnerFs(label);
+        try {
+          await this.engine.refreshProviderModels();
+        } finally {
+          this.stopSpinnerFs();
+        }
+      } else {
+        const spin = new TerminalSpinner();
+        spin.start(label);
+        try {
+          await this.engine.refreshProviderModels();
+        } finally {
+          spin.stop();
+        }
+      }
+    };
 
     const initialConnected = this.engine.getConnectedProviders();
     if (initialConnected.length === 0) {
+      // Probe local Ollama once before concluding no providers are connected (matches WebUI)
+      await runRefreshWithSpinner("Checking connected providers & local runtimes");
+    }
+
+    if (this.engine.getConnectedProviders().length === 0) {
       process.stdout.write(
         `\n  ${c(PALETTE.warning, "!")} ${c(PALETTE.text, "No providers connected yet.")} ${c(PALETTE.muted, "Connect a provider first with /connect or /login.")}\n`,
       );
@@ -2722,27 +3024,13 @@ export class YedoguTui {
     }
 
     // Lazily fetch live models for any connected provider not yet synced
-    const needsSync = initialConnected.some((p) => !this.engine.hasLiveModelsCached(p.id));
+    const needsSync = this.engine.getConnectedProviders().some((p) => !this.engine.hasLiveModelsCached(p.id));
     if (needsSync) {
-      if (this.fullScreenActive) {
-        this.startSpinnerFs("Syncing models from connected providers");
-        try {
-          await this.engine.refreshProviderModels();
-        } finally {
-          this.stopSpinnerFs();
-        }
-      } else {
-        const spin = new TerminalSpinner();
-        spin.start("Syncing models from connected providers");
-        try {
-          await this.engine.refreshProviderModels();
-        } finally {
-          spin.stop();
-        }
-      }
+      await runRefreshWithSpinner("Syncing models from connected providers");
     }
 
     const EFFORT_DESCRIPTIONS: Record<string, string> = {
+      none: "No extended thinking — lowest latency",
       low: "Fastest responses with minimal reasoning overhead",
       medium: "Balanced speed and reasoning quality for most tasks",
       high: "Deeper reasoning for complex analysis and debugging",
@@ -2750,173 +3038,342 @@ export class YedoguTui {
       max: "Maximum reasoning budget and thoroughness",
     };
 
+    const EFFORT_SHORT: Record<string, string> = {
+      none: "Off",
+      low: "Low",
+      medium: "Med",
+      high: "High",
+      xhigh: "Extra",
+      max: "Max",
+    };
+
+    type PickerItem =
+      | { kind: "model"; group: GroupedModelEntry }
+      | { kind: "action"; action: "refresh" | "providers" };
+
     // Track chosen effort/variant index per model group
     const variantState = new Map<string, number>();
+    const effortState = new Map<string, ReasoningEffort>();
 
-    const initVariantState = (groups: GroupedModelEntry[], currentTarget: string): void => {
+    const getEffortLevelsForGroup = (g: GroupedModelEntry): ReasoningEffort[] => {
+      const primary = g.variants[0]?.model;
+      if (primary?.reasoningLevels && primary.reasoningLevels.length > 1) {
+        return primary.reasoningLevels;
+      }
+      const inferred = primary ? inferReasoningLevels(g.provider.id, primary.id, primary.supportsReasoning) : undefined;
+      if (inferred && inferred.length > 1) return inferred;
+      return primary?.supportsReasoning ? ["low", "medium", "high"] : ["none", "low", "medium", "high"];
+    };
+
+    const initStates = (groups: GroupedModelEntry[], currentTarget: string): void => {
+      const curEffort = (this.engine.session.reasoningEffort || this.engine.config.reasoningEffort || "medium") as ReasoningEffort;
       for (const g of groups) {
-        if (variantState.has(g.key)) continue;
-        const activeIdx = g.variants.findIndex((v) => v.spec === currentTarget);
-        if (activeIdx !== -1) {
-          variantState.set(g.key, activeIdx);
-        } else {
-          const medIdx = g.variants.findIndex((v) => v.label === "medium");
-          variantState.set(g.key, medIdx !== -1 ? medIdx : 0);
+        if (!variantState.has(g.key)) {
+          const activeIdx = g.variants.findIndex((v) => v.spec === currentTarget);
+          if (activeIdx !== -1) {
+            variantState.set(g.key, activeIdx);
+          } else {
+            const medIdx = g.variants.findIndex((v) => v.label === "medium");
+            variantState.set(g.key, medIdx !== -1 ? medIdx : 0);
+          }
+        }
+        if (!effortState.has(g.key)) {
+          const levels = getEffortLevelsForGroup(g);
+          effortState.set(g.key, levels.includes(curEffort) ? curEffort : levels[Math.min(1, levels.length - 1)]);
         }
       }
     };
 
-    const connectedProviders = this.engine.getConnectedProviders();
-    const multiProvider = connectedProviders.length > 1;
-    const grouped = groupModelsForPicker(connectedProviders);
-    const initialTarget = this.engine.session.activeModel;
-    initVariantState(grouped, initialTarget);
+    while (true) {
+      const connectedProviders = this.engine.getConnectedProviders();
+      if (providerFilter !== "all" && !connectedProviders.some((p) => p.id === providerFilter)) {
+        providerFilter = "all";
+      }
+      const filterOrder = ["all", ...connectedProviders.map((p) => p.id)];
 
-    const buildModelOptions = (): SelectOption<GroupedModelEntry>[] => {
-      const currentTarget = pinToAgent
-        ? this.engine.getEffectiveModelForAgent(activeAgent)
-        : this.engine.session.activeModel;
-      const curProviders = this.engine.getConnectedProviders();
-      const groups = groupModelsForPicker(curProviders);
-      initVariantState(groups, currentTarget);
+      const buildSubtitle = (): string => {
+        const filterLabel =
+          providerFilter === "all"
+            ? `All (${connectedProviders.length})`
+            : connectedProviders.find((p) => p.id === providerFilter)?.name || providerFilter;
+        return `${filterLabel} · ${pinToAgent ? `Pin → @${activeAgent}` : "Default"}`;
+      };
 
-      return groups.map((g) => {
-        const isCurrent = g.variants.some((v) => v.spec === currentTarget);
-        const badgeText = isCurrent
-          ? "(current)"
-          : multiProvider
-            ? g.provider.id
-            : undefined;
-        const badgeColor = isCurrent ? PALETTE.accent : PALETTE.muted;
-        const allIds = g.variants.map((v) => `${v.spec} ${v.label} ${v.model.name}`).join(" ");
-        return {
-          value: g,
-          label: g.displayName,
-          badge: badgeText,
-          badgeColor,
-          active: isCurrent,
-          keywords: `${g.provider.id} ${g.provider.name} ${g.displayName} ${allIds}`,
-        };
+      const buildModelOptions = (): SelectOption<PickerItem>[] => {
+        const currentTarget = pinToAgent
+          ? this.engine.getEffectiveModelForAgent(activeAgent)
+          : this.engine.session.activeModel;
+        const curProviders = this.engine.getConnectedProviders();
+        const favs = new Set(this.engine.getFavoriteModels());
+        let groups = groupModelsForPicker(curProviders);
+        initStates(groups, currentTarget);
+
+        if (providerFilter !== "all") {
+          groups = groups.filter((g) => g.provider.id === providerFilter);
+        }
+
+        // Sort favorites first (preserving provider grouping order within non-favorites, matching WebUI)
+        groups.sort((a, b) => {
+          const af = favs.has(a.key) ? 0 : 1;
+          const bf = favs.has(b.key) ? 0 : 1;
+          return af - bf;
+        });
+
+        const modelOpts: SelectOption<PickerItem>[] = groups.map((g) => {
+          const isCurrent = g.variants.some((v) => v.spec === currentTarget);
+          const isFav = favs.has(g.key);
+          const curEffort = g.variants.length > 1
+            ? g.variants[Math.max(0, Math.min(variantState.get(g.key) ?? 0, g.variants.length - 1))]?.label
+            : effortState.get(g.key);
+          const effTag = curEffort ? (EFFORT_SHORT[curEffort] || curEffort) : "";
+          const badgeText = isCurrent
+            ? `● ${effTag || "active"}`
+            : effTag
+              ? `${effTag} · ${g.provider.id}`
+              : g.provider.id;
+          const badgeColor = isCurrent ? PALETTE.accent : PALETTE.muted;
+          const allIds = g.variants.map((v) => `${v.spec} ${v.label} ${v.model.name}`).join(" ");
+          return {
+            value: { kind: "model", group: g },
+            label: `${isFav ? "★ " : ""}${g.displayName}`,
+            badge: badgeText,
+            badgeColor,
+            active: isCurrent,
+            checked: isCurrent,
+            category: isFav ? "★ Favorites" : g.provider.name,
+            keywords: `${g.provider.id} ${g.provider.name} ${g.displayName} ${allIds}${isFav ? " favorite star pinned" : ""}`,
+          };
+        });
+
+        modelOpts.push(
+          {
+            value: { kind: "action", action: "refresh" },
+            label: "↻ Refresh / Sync Live Models",
+            description: "Fetch latest models from all connected providers",
+            badge: "^R",
+            badgeColor: PALETTE.info,
+            category: "Actions",
+            keywords: "refresh sync reload live models",
+          },
+          {
+            value: { kind: "action", action: "providers" },
+            label: "+ Connect / Manage Providers & Custom Endpoints",
+            description: "Add API keys, CLI logins, or custom URLs",
+            badge: "^A",
+            badgeColor: PALETTE.accent,
+            category: "Actions",
+            keywords: "connect manage provider custom endpoint add",
+          },
+        );
+        return modelOpts;
+      };
+
+      const renderEffortPanel = (
+        selected: SelectOption<PickerItem> | undefined,
+        innerWidth: number,
+      ): string[] => {
+        // Provider filter pills row (matching WebUI's provider rail)
+        const pills = filterOrder
+          .slice(0, 7)
+          .map((pid) => {
+            const label = pid === "all" ? "All" : pid;
+            return pid === providerFilter
+              ? c(PALETTE.accent + PALETTE.bold, `[${label}]`)
+              : c(PALETTE.muted, label);
+          })
+          .join("  ");
+        const filterLine = `  ${c(PALETTE.muted, "Filter")}  ${pills}${filterOrder.length > 7 ? c(PALETTE.muted, ` +${filterOrder.length - 7}`) : ""}  ${c(PALETTE.muted, "(^F)")}`;
+
+        if (!selected || selected.value.kind !== "model") {
+          return [filterLine];
+        }
+        const g = selected.value.group;
+
+        const isVariantMode = g.variants.length > 1;
+        const levels = isVariantMode
+          ? g.variants.map((v) => v.label)
+          : getEffortLevelsForGroup(g);
+        const idx = isVariantMode
+          ? Math.max(0, Math.min(variantState.get(g.key) ?? 0, levels.length - 1))
+          : Math.max(0, levels.indexOf(effortState.get(g.key) ?? "medium"));
+        const activeLabel = levels[idx] || "medium";
+        const panelTitle = isVariantMode && !g.isEffortGroup ? "Variant" : "Effort";
+
+        const n = levels.length;
+        const segLen = Math.max(4, Math.min(9, Math.floor((innerWidth - 26) / Math.max(1, n - 1))));
+        const step = segLen + 1;
+
+        const leftArrow = idx > 0 ? c(PALETTE.accent, "◂") : c(PALETTE.muted, "◂");
+        const rightArrow = idx < n - 1 ? c(PALETTE.accent, "▸") : c(PALETTE.muted, "▸");
+
+        const prefixPlain = `  ${panelTitle.padEnd(7)} ◂     `;
+        const prefixStyled = `  ${c(PALETTE.secondary + PALETTE.bold, panelTitle.padEnd(7))} ${leftArrow}     `;
+
+        let track = "";
+        for (let i = 0; i < n; i++) {
+          if (i < idx) track += c(PALETTE.accent, "●");
+          else if (i === idx) track += c(PALETTE.accent + PALETTE.bold, "◉");
+          else track += c(PALETTE.muted, "○");
+
+          if (i < n - 1) {
+            track += i < idx ? c(PALETTE.accent, "━".repeat(segLen)) : c(PALETTE.border, "─".repeat(segLen));
+          }
+        }
+        const trackLine = `${prefixStyled}${track}     ${rightArrow}`;
+
+        const baseCol = prefixPlain.length;
+        let cursor = 0;
+        let labelsLine = "";
+        for (let i = 0; i < n; i++) {
+          const lbl = EFFORT_SHORT[levels[i]] || levels[i];
+          const centerCol = baseCol + i * step;
+          const startCol = Math.max(cursor + (i > 0 ? 1 : 0), centerCol - Math.floor(lbl.length / 2));
+          if (startCol > cursor) {
+            labelsLine += " ".repeat(startCol - cursor);
+          }
+          labelsLine += i === idx ? c(PALETTE.text + PALETTE.bold, lbl) : c(PALETTE.muted, lbl);
+          cursor = startCol + lbl.length;
+        }
+
+        const primaryModel = isVariantMode ? g.variants[idx]?.model : g.variants[0]?.model;
+        const ctx = primaryModel
+          ? primaryModel.contextWindow >= 1_000_000
+            ? `${(primaryModel.contextWindow / 1_000_000).toFixed(0)}M`
+            : `${Math.round(primaryModel.contextWindow / 1000)}k`
+          : "";
+        const descText =
+          EFFORT_DESCRIPTIONS[activeLabel] ||
+          `${g.provider.name}${ctx ? ` · ${ctx} ctx` : ""}`;
+        const descPad = " ".repeat(Math.max(2, Math.min(10, baseCol - 4)));
+        const descLine = `${descPad}${c(PALETTE.muted, `${descText}${ctx ? ` · ${ctx} ctx` : ""}`)}`;
+
+        return [filterLine, trackLine, labelsLine, descLine];
+      };
+
+      const initialOptions = buildModelOptions();
+      const initialIdx = Math.max(
+        0,
+        initialOptions.findIndex((o) => o.active),
+      );
+
+      const res = await this.runSelectModal<PickerItem>({
+        title: "Switch Model",
+        subtitle: buildSubtitle(),
+        placeholder: "Search models or providers…",
+        options: initialOptions,
+        initialIndex: initialIdx,
+        width: 78,
+        footerHints: "↑↓ move · ←→ effort · ^F provider · ^S star · ^R sync · tab pin · ↵ select",
+        onLeftRight: (delta, selected) => {
+          if (!selected || selected.value.kind !== "model") return;
+          const g = selected.value.group;
+          if (g.variants.length > 1) {
+            const cur = variantState.get(g.key) ?? 0;
+            const next = Math.max(0, Math.min(g.variants.length - 1, cur + delta));
+            variantState.set(g.key, next);
+          } else {
+            const levels = getEffortLevelsForGroup(g);
+            const cur = effortState.get(g.key) ?? "medium";
+            const curIdx = Math.max(0, levels.indexOf(cur));
+            const nextIdx = Math.max(0, Math.min(levels.length - 1, curIdx + delta));
+            effortState.set(g.key, levels[nextIdx]);
+          }
+          return { options: buildModelOptions() };
+        },
+        renderFooterPanel: renderEffortPanel,
+        onTab: () => {
+          pinToAgent = !pinToAgent;
+          return {
+            subtitle: buildSubtitle(),
+            options: buildModelOptions(),
+          };
+        },
+        onKey: (_str, key, selected) => {
+          // Ctrl+F: cycle provider filter (All -> Anthropic -> OpenAI -> ...)
+          if (key.ctrl && key.name === "f") {
+            const curIdx = filterOrder.indexOf(providerFilter);
+            providerFilter = filterOrder[(curIdx + 1) % filterOrder.length] ?? "all";
+            return {
+              subtitle: buildSubtitle(),
+              options: buildModelOptions(),
+              selectedIndex: 0,
+            };
+          }
+          // Ctrl+S: star / unstar favorite model (synced with WebUI)
+          if (key.ctrl && key.name === "s") {
+            if (selected?.value.kind === "model") {
+              this.engine.toggleFavoriteModel(selected.value.group.key);
+              return { options: buildModelOptions() };
+            }
+            return true;
+          }
+          // Ctrl+R: trigger live model refresh
+          if (key.ctrl && key.name === "r") {
+            return {
+              closeWith: {
+                action: "select",
+                value: { kind: "action", action: "refresh" },
+                option: { value: { kind: "action", action: "refresh" }, label: "Refresh" },
+              },
+            };
+          }
+          // Ctrl+A: open providers / connectors manager
+          if (key.ctrl && key.name === "a") {
+            return {
+              closeWith: {
+                action: "select",
+                value: { kind: "action", action: "providers" },
+                option: { value: { kind: "action", action: "providers" }, label: "Providers" },
+              },
+            };
+          }
+          return false;
+        },
       });
-    };
 
-    const renderEffortPanel = (
-      selected: SelectOption<GroupedModelEntry> | undefined,
-      innerWidth: number,
-    ): string[] => {
-      if (!selected) return [];
-      const g = selected.value;
-      const idx = Math.max(0, Math.min(variantState.get(g.key) ?? 0, g.variants.length - 1));
-      const activeVar = g.variants[idx];
+      if (res.action !== "select") return;
 
-      if (g.variants.length <= 1) {
-        const ctx = activeVar.model.contextWindow >= 1_000_000
-          ? `${(activeVar.model.contextWindow / 1_000_000).toFixed(0)}M`
-          : `${Math.round(activeVar.model.contextWindow / 1000)}k`;
-        return [
-          `  ${c(PALETTE.muted, "Model")}   ${c(PALETTE.secondary, activeVar.spec)}  ${c(PALETTE.muted, `· ${ctx} context · ${g.provider.name}`)}`,
-        ];
+      if (res.value.kind === "action") {
+        if (res.value.action === "refresh") {
+          await runRefreshWithSpinner("Refreshing live models from connected providers");
+          continue;
+        }
+        if (res.value.action === "providers") {
+          await this.openProviderManager();
+          continue;
+        }
+        return;
       }
 
-      const panelTitle = g.isEffortGroup ? "Effort" : "Variant";
-      const n = g.variants.length;
-      const segLen = Math.max(5, Math.min(10, Math.floor((innerWidth - 26) / Math.max(1, n - 1))));
-      const step = segLen + 1;
-
-      const leftArrow = idx > 0 ? c(PALETTE.accent, "◂") : c(PALETTE.muted, "◂");
-      const rightArrow = idx < n - 1 ? c(PALETTE.accent, "▸") : c(PALETTE.muted, "▸");
-
-      const prefixPlain = `  ${panelTitle.padEnd(7)} ◂     `;
-      const prefixStyled = `  ${c(PALETTE.secondary + PALETTE.bold, panelTitle.padEnd(7))} ${leftArrow}     `;
-
-      let track = "";
-      for (let i = 0; i < n; i++) {
-        if (i < idx) track += c(PALETTE.accent, "●");
-        else if (i === idx) track += c(PALETTE.accent + PALETTE.bold, "◉");
-        else track += c(PALETTE.muted, "○");
-
-        if (i < n - 1) {
-          track += i < idx ? c(PALETTE.accent, "━".repeat(segLen)) : c(PALETTE.border, "─".repeat(segLen));
+      const chosenGroup = res.value.group;
+      const chosenIdx = Math.max(
+        0,
+        Math.min(variantState.get(chosenGroup.key) ?? 0, chosenGroup.variants.length - 1),
+      );
+      const chosenVariant = chosenGroup.variants[chosenIdx];
+      const normalized = this.engine.setModel(chosenVariant.spec, pinToAgent ? activeAgent : undefined);
+      let appliedEffort: string | undefined;
+      if (chosenGroup.variants.length <= 1) {
+        const chosenEff = effortState.get(chosenGroup.key);
+        if (chosenEff) {
+          appliedEffort = this.engine.setReasoningEffort(chosenEff);
         }
       }
-      const trackLine = `${prefixStyled}${track}     ${rightArrow}`;
-
-      // Build aligned labels row directly beneath each node center
-      const baseCol = prefixPlain.length;
-      let cursor = 0;
-      let labelsLine = "";
-      for (let i = 0; i < n; i++) {
-        const lbl = g.variants[i].label;
-        const centerCol = baseCol + i * step;
-        const startCol = Math.max(cursor + (i > 0 ? 1 : 0), centerCol - Math.floor(lbl.length / 2));
-        if (startCol > cursor) {
-          labelsLine += " ".repeat(startCol - cursor);
-        }
-        labelsLine += i === idx ? c(PALETTE.text + PALETTE.bold, lbl) : c(PALETTE.muted, lbl);
-        cursor = startCol + lbl.length;
+      if (!this.recentModels.includes(normalized)) {
+        this.recentModels.unshift(normalized);
+        if (this.recentModels.length > 8) this.recentModels.pop();
       }
-
-      const descText =
-        EFFORT_DESCRIPTIONS[activeVar.label] ||
-        `${activeVar.model.name} · ${activeVar.spec}`;
-      const descPad = " ".repeat(Math.max(2, Math.min(10, baseCol - 4)));
-      const descLine = `${descPad}${c(PALETTE.muted, descText)}`;
-
-      return [trackLine, labelsLine, descLine];
-    };
-
-    const initialOptions = buildModelOptions();
-    const initialIdx = Math.max(
-      0,
-      initialOptions.findIndex((o) => o.active),
-    );
-    const connectedCount = connectedProviders.length;
-
-    const res = await this.runSelectModal({
-      title: "Switch Model",
-      subtitle: `${connectedCount} connected · Target: Default`,
-      placeholder: "Search models…",
-      options: initialOptions,
-      initialIndex: initialIdx,
-      footerHints: "↑/↓ navigate · ←/→ effort · tab pin/@agent · enter select · esc close",
-      onLeftRight: (delta, selected) => {
-        if (!selected || selected.value.variants.length <= 1) return;
-        const g = selected.value;
-        const cur = variantState.get(g.key) ?? 0;
-        const next = Math.max(0, Math.min(g.variants.length - 1, cur + delta));
-        variantState.set(g.key, next);
-      },
-      renderFooterPanel: renderEffortPanel,
-      onTab: () => {
-        pinToAgent = !pinToAgent;
-        return {
-          subtitle: pinToAgent
-            ? `${connectedCount} connected · Pin → @${activeAgent}`
-            : `${connectedCount} connected · Target: Default`,
-          options: buildModelOptions(),
-        };
-      },
-    });
-
-    if (res.action !== "select") return;
-    const chosenGroup = res.value;
-    const chosenIdx = Math.max(
-      0,
-      Math.min(variantState.get(chosenGroup.key) ?? 0, chosenGroup.variants.length - 1),
-    );
-    const chosenVariant = chosenGroup.variants[chosenIdx];
-    const normalized = this.engine.setModel(chosenVariant.spec, pinToAgent ? activeAgent : undefined);
-    if (!this.recentModels.includes(normalized)) {
-      this.recentModels.unshift(normalized);
-      if (this.recentModels.length > 8) this.recentModels.pop();
+      const effortNote =
+        chosenGroup.variants.length > 1
+          ? ` ${c(PALETTE.muted, `(${chosenVariant.label})`)}`
+          : appliedEffort
+            ? ` ${c(PALETTE.muted, `(effort: ${appliedEffort})`)}`
+            : "";
+      process.stdout.write(
+        `\n  ${c(PALETTE.success, "✓")} ${pinToAgent ? `Pinned ${c(PALETTE.accent + PALETTE.bold, `@${activeAgent}`)}` : "Default model"} → ${c(PALETTE.text + PALETTE.bold, chosenGroup.displayName)}${effortNote} ${c(PALETTE.muted, `[${normalized}]`)}\n`,
+      );
+      return;
     }
-    const effortNote =
-      chosenGroup.variants.length > 1
-        ? ` ${c(PALETTE.muted, `(${chosenVariant.label})`)}`
-        : "";
-    process.stdout.write(
-      `\n  ${c(PALETTE.success, "✓")} ${pinToAgent ? `Pinned ${c(PALETTE.accent + PALETTE.bold, `@${activeAgent}`)}` : "Default model"} → ${c(PALETTE.text + PALETTE.bold, chosenGroup.displayName)}${effortNote} ${c(PALETTE.muted, `[${normalized}]`)}\n`,
-    );
   }
 
   private async openAgentPicker(): Promise<void> {
@@ -3005,8 +3462,36 @@ export class YedoguTui {
 
   private async openProviderManager(): Promise<void> {
     const popularOrder = ["anthropic", "gemini", "openai", "codex"];
+    type PrvFilter = "all" | "connected" | "cloud" | "gateway" | "local" | "custom";
+    const filterOrder: PrvFilter[] = ["all", "connected", "cloud", "gateway", "local", "custom"];
+    const filterLabels: Record<PrvFilter, string> = {
+      all: "All",
+      connected: "Connected",
+      cloud: "Cloud",
+      gateway: "Gateways",
+      local: "Local",
+      custom: "Custom",
+    };
+    let activeFilter: PrvFilter = "all";
+
+    const getCategory = (p: ProviderConfig): Exclude<PrvFilter, "all" | "connected"> => {
+      if (p.custom) return "custom";
+      if (p.local) return "local";
+      if (p.id === "openrouter" || p.id === "groq") return "gateway";
+      return "cloud";
+    };
+
+    type ProviderHubItem =
+      | { kind: "provider"; provider: ProviderConfig }
+      | { kind: "add_custom" }
+      | { kind: "refresh_all" }
+      | { kind: "agent_routing" };
+
     while (true) {
-      const providers = [...this.engine.getProviders()].sort((a, b) => {
+      const allProviders = [...this.engine.getProviders()].sort((a, b) => {
+        const ac = isProviderConnected(a);
+        const bc = isProviderConnected(b);
+        if (ac !== bc) return ac ? -1 : 1;
         if (a.custom && !b.custom) return -1;
         if (!a.custom && b.custom) return 1;
         const ia = popularOrder.indexOf(a.id);
@@ -3016,57 +3501,310 @@ export class YedoguTui {
         if (ib !== -1) return 1;
         return a.name.localeCompare(b.name);
       });
-      const options: SelectOption<ProviderConfig | "__add_custom__">[] = [
-        {
-          value: "__add_custom__",
-          label: "+ Add Custom Provider…",
-          description: "OpenAI / Anthropic / Gemini compatible endpoint",
-          badge: "Custom URL",
-          badgeColor: PALETTE.accent,
-          category: "Custom",
-          keywords: "add custom provider url vllm litellm ollama azure openai anthropic gemini",
-        },
-        ...providers.map((p) => {
-          const connected = isProviderConnected(p);
-          const isPopular = popularOrder.includes(p.id);
-          return {
-            value: p as ProviderConfig | "__add_custom__",
-            label: p.name,
-            description: p.id,
-            badge: connected
-              ? p.authSource === "config" || p.authSource === "env"
-                ? "API key"
-                : p.authSource || "Connected"
+      const connectedCount = allProviders.filter(isProviderConnected).length;
+      const totalModels = allProviders
+        .filter(isProviderConnected)
+        .reduce((sum, p) => sum + p.models.length, 0);
+
+      const buildOptions = (): SelectOption<ProviderHubItem>[] => {
+        const filteredProviders = allProviders.filter((p) => {
+          if (activeFilter === "all") return true;
+          if (activeFilter === "connected") return isProviderConnected(p);
+          return getCategory(p) === activeFilter;
+        });
+
+        return [
+          {
+            value: { kind: "add_custom" },
+            label: "+ Add Custom Provider / Preset…",
+            description: "OpenAI / Anthropic / Gemini compatible endpoint + auto-probe",
+            badge: "Custom",
+            badgeColor: PALETTE.accent,
+            category: "Actions",
+            keywords: "add custom provider url vllm litellm ollama together openrouter lmstudio azure",
+          },
+          {
+            value: { kind: "refresh_all" },
+            label: "↻ Refresh / Sync All Live Models",
+            description: `${connectedCount} connected · ${totalModels} available models`,
+            badge: "^R",
+            badgeColor: PALETTE.info,
+            category: "Actions",
+            keywords: "refresh sync reload models live",
+          },
+          {
+            value: { kind: "agent_routing" },
+            label: "⇄ Per-Agent Model Routing",
+            description: "Pin specific models to specialist @agents",
+            badge: "Routing",
+            badgeColor: PALETTE.accentSoft,
+            category: "Actions",
+            keywords: "agent routing pin model specialist commander recon reverser",
+          },
+          ...filteredProviders.map((p) => {
+            const connected = isProviderConnected(p);
+            const meta = this.engine.getProviderLiveMeta(p.id);
+            const isPopular = popularOrder.includes(p.id);
+            const modelNames = p.models.slice(0, 3).map((m) => m.name).join(", ");
+            const badge = connected
+              ? meta && !meta.live && meta.error
+                ? "⚠ err"
+                : `${p.authSource === "config" || p.authSource === "env" ? "API key" : p.authSource || "live"} · ${p.models.length}`
               : p.local
                 ? "local"
-                : "",
-            badgeColor: PALETTE.muted,
-            active: connected,
-            checked: connected,
-            category: p.custom ? "Custom" : isPopular ? "Popular" : "Services",
-            keywords: `${p.id} ${p.name} ${p.defaultModel}`,
-          };
-        }),
-      ];
+                : "connect";
+            return {
+              value: { kind: "provider", provider: p } as ProviderHubItem,
+              label: p.name,
+              description: modelNames || `${p.protocol} · ${p.baseUrl}`,
+              badge,
+              badgeColor: connected
+                ? meta && !meta.live && meta.error
+                  ? PALETTE.danger
+                  : PALETTE.success
+                : PALETTE.muted,
+              active: connected,
+              checked: connected,
+              category: connected
+                ? "Connected"
+                : p.custom
+                  ? "Custom"
+                  : isPopular
+                    ? "Popular"
+                    : getCategory(p) === "local"
+                      ? "Local"
+                      : getCategory(p) === "gateway"
+                        ? "Gateways"
+                        : "Cloud",
+              keywords: `${p.id} ${p.name} ${p.protocol} ${p.defaultModel} ${getCategory(p)} ${p.models.map((m) => `${m.id} ${m.name}`).join(" ")}`,
+            };
+          }),
+        ];
+      };
 
-      const res = await this.runSelectModal({
-        title: "Connect an integration",
-        placeholder: "Search",
-        options,
-        footerHints: "↑↓ move · ↵ connect/manage · esc close",
+      const renderFilterFooter = (): string[] => {
+        const pills = filterOrder
+          .map((f) =>
+            f === activeFilter
+              ? c(PALETTE.accent + PALETTE.bold, `[${filterLabels[f]}]`)
+              : c(PALETTE.muted, filterLabels[f]),
+          )
+          .join("  ");
+        return [`  ${c(PALETTE.muted, "Filter")}  ${pills}  ${c(PALETTE.muted, "(tab / ^F)")}`];
+      };
+
+      const res = await this.runSelectModal<ProviderHubItem>({
+        title: "Providers & Integrations",
+        subtitle: `${connectedCount}/${allProviders.length} connected · ${totalModels} models · ${filterLabels[activeFilter]}`,
+        placeholder: "Search providers or models…",
+        options: buildOptions(),
+        width: 78,
+        footerHints: "↑↓ move · tab/^F filter · ^R sync all · ↵ manage · esc close",
+        renderFooterPanel: renderFilterFooter,
+        onTab: () => {
+          const idx = filterOrder.indexOf(activeFilter);
+          activeFilter = filterOrder[(idx + 1) % filterOrder.length] ?? "all";
+          return {
+            subtitle: `${connectedCount}/${allProviders.length} connected · ${totalModels} models · ${filterLabels[activeFilter]}`,
+            options: buildOptions(),
+          };
+        },
+        onKey: (_str, key) => {
+          if (key.ctrl && key.name === "f") {
+            const idx = filterOrder.indexOf(activeFilter);
+            activeFilter = filterOrder[(idx + 1) % filterOrder.length] ?? "all";
+            return {
+              subtitle: `${connectedCount}/${allProviders.length} connected · ${totalModels} models · ${filterLabels[activeFilter]}`,
+              options: buildOptions(),
+            };
+          }
+          if (key.ctrl && key.name === "r") {
+            return {
+              closeWith: {
+                action: "select",
+                value: { kind: "refresh_all" },
+                option: { value: { kind: "refresh_all" }, label: "Refresh All" },
+              },
+            };
+          }
+          return false;
+        },
       });
       if (res.action !== "select") return;
-      if (res.value === "__add_custom__") {
-        const added = await this.openCustomProviderFormModal();
-        if (added) return;
+      if (res.value.kind === "add_custom") {
+        await this.openCustomProviderFormModal();
         continue;
       }
-      const outcome = await this.openConnectKeyModal(res.value, true);
+      if (res.value.kind === "refresh_all") {
+        if (this.fullScreenActive) {
+          this.startSpinnerFs("Syncing live models for all connected providers");
+          try {
+            await this.engine.refreshProviderModels();
+          } finally {
+            this.stopSpinnerFs();
+          }
+        } else {
+          const spin = new TerminalSpinner();
+          spin.start("Syncing live models for all connected providers");
+          try {
+            await this.engine.refreshProviderModels();
+          } finally {
+            spin.stop();
+          }
+        }
+        continue;
+      }
+      if (res.value.kind === "agent_routing") {
+        await this.openAgentRoutingManager();
+        continue;
+      }
+      const outcome = await this.openConnectKeyModal(res.value.provider, true);
       if (outcome !== "back") return;
     }
   }
 
+  private async openAgentRoutingManager(): Promise<void> {
+    while (true) {
+      const agents = this.engine.getAgents();
+      const options: SelectOption<string>[] = agents.map((a) => {
+        const pinned = this.engine.session.agentModels[a.id];
+        const effective = this.engine.getEffectiveModelForAgent(a.id);
+        return {
+          value: a.id,
+          label: `@${a.id}`,
+          description: a.title,
+          badge: pinned ? `📌 ${truncatePlain(pinned, 24)}` : `default (${truncatePlain(effective, 18)})`,
+          badgeColor: pinned ? PALETTE.accent : PALETTE.muted,
+          active: Boolean(pinned),
+          checked: Boolean(pinned),
+          keywords: `${a.id} ${a.title} ${effective}`,
+        };
+      });
+
+      const res = await this.runSelectModal({
+        title: "Per-Agent Model Routing",
+        subtitle: `${agents.length} specialist agents`,
+        placeholder: "Pick an agent to pin or reset its model…",
+        options,
+        footerHints: "↑↓ pick agent · ↵ pin model · esc back",
+      });
+      if (res.action !== "select") return;
+
+      const agentId = res.value;
+      const connected = this.engine.getConnectedProviders();
+      const groups = groupModelsForPicker(connected);
+      const currentPin = this.engine.session.agentModels[agentId] || "";
+      const modelOptions: SelectOption<string>[] = [
+        {
+          value: "__default__",
+          label: `Use Global Default (${this.engine.session.activeModel})`,
+          description: "Clear per-agent override",
+          badge: !currentPin ? "active" : "reset",
+          badgeColor: !currentPin ? PALETTE.success : PALETTE.muted,
+          active: !currentPin,
+          checked: !currentPin,
+          category: "Default",
+        },
+        ...groups.flatMap((g) =>
+          g.variants.map((v) => ({
+            value: v.spec,
+            label: g.variants.length > 1 ? `${g.displayName} (${v.label})` : g.displayName,
+            description: v.spec,
+            badge: v.spec === currentPin ? "pinned" : g.provider.id,
+            badgeColor: v.spec === currentPin ? PALETTE.accent : PALETTE.muted,
+            active: v.spec === currentPin,
+            checked: v.spec === currentPin,
+            category: g.provider.name,
+            keywords: `${g.provider.id} ${g.provider.name} ${g.displayName} ${v.spec}`,
+          })),
+        ),
+      ];
+
+      const picked = await this.runSelectModal({
+        title: `Pin Model → @${agentId}`,
+        subtitle: currentPin || "Default",
+        placeholder: "Search connected models…",
+        options: modelOptions,
+        footerHints: "↑↓ move · ↵ pin · esc back",
+      });
+      if (picked.action !== "select") continue;
+
+      if (picked.value === "__default__") {
+        this.engine.clearAgentModel(agentId);
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Reset ${c(PALETTE.accent, `@${agentId}`)} to global default model.\n`);
+      } else {
+        const normalized = this.engine.setModel(picked.value, agentId);
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Pinned ${c(PALETTE.accent, `@${agentId}`)} → ${c(PALETTE.text + PALETTE.bold, normalized)}\n`);
+      }
+    }
+  }
+
   private async openCustomProviderFormModal(existing?: ProviderConfig): Promise<boolean> {
+    let preset: {
+      id: string;
+      name: string;
+      protocol: ProviderProtocol;
+      baseUrl: string;
+      model: string;
+    } | undefined;
+
+    if (!existing) {
+      const presets: Array<{
+        key: string;
+        label: string;
+        desc: string;
+        data?: { id: string; name: string; protocol: ProviderProtocol; baseUrl: string; model: string };
+      }> = [
+        { key: "blank", label: "Custom Endpoint (Blank)", desc: "Enter any OpenAI / Anthropic / Gemini compatible URL" },
+        {
+          key: "openrouter",
+          label: "Preset: OpenRouter Custom",
+          desc: "https://openrouter.ai/api/v1 · anthropic/claude-sonnet-4-6",
+          data: { id: "custom-openrouter", name: "OpenRouter Custom", protocol: "openai", baseUrl: "https://openrouter.ai/api/v1", model: "anthropic/claude-sonnet-4-6" },
+        },
+        {
+          key: "together",
+          label: "Preset: Together AI",
+          desc: "https://api.together.xyz/v1 · Llama 3.3 70B",
+          data: { id: "together", name: "Together AI", protocol: "openai", baseUrl: "https://api.together.xyz/v1", model: "meta-llama/Llama-3.3-70B-Instruct-Turbo" },
+        },
+        {
+          key: "vllm",
+          label: "Preset: vLLM Local",
+          desc: "http://127.0.0.1:8000/v1 · auto-probe models",
+          data: { id: "vllm", name: "vLLM Local", protocol: "openai", baseUrl: "http://127.0.0.1:8000/v1", model: "" },
+        },
+        {
+          key: "litellm",
+          label: "Preset: LiteLLM Proxy",
+          desc: "http://127.0.0.1:4000/v1 · gpt-4o",
+          data: { id: "litellm", name: "LiteLLM Proxy", protocol: "openai", baseUrl: "http://127.0.0.1:4000/v1", model: "gpt-4o" },
+        },
+        {
+          key: "lmstudio",
+          label: "Preset: LM Studio Custom",
+          desc: "http://127.0.0.1:1234/v1 · auto-probe models",
+          data: { id: "lmstudio-custom", name: "LM Studio Custom", protocol: "openai", baseUrl: "http://127.0.0.1:1234/v1", model: "" },
+        },
+      ];
+      const pick = await this.runSelectModal({
+        title: "Add Custom Provider",
+        subtitle: "Choose a preset or blank",
+        placeholder: "Filter presets…",
+        options: presets.map((pr) => ({
+          value: pr,
+          label: pr.label,
+          description: pr.desc,
+          badge: pr.data ? pr.data.protocol : "custom",
+          badgeColor: pr.data ? PALETTE.info : PALETTE.accent,
+          keywords: `${pr.key} ${pr.label} ${pr.desc}`,
+        })),
+        footerHints: "↑↓ choose preset · ↵ continue · esc back",
+      });
+      if (pick.action !== "select") return false;
+      preset = pick.value.data;
+    }
+
     const existingExtra = existing
       ? existing.models
           .filter((m) => m.id !== existing.defaultModel)
@@ -3077,42 +3815,98 @@ export class YedoguTui {
       title: existing ? `Edit Custom Provider (${existing.id})` : "Add Custom Provider",
       subtitle: "OpenAI / Anthropic / Gemini",
       steps: [
-        "Enter a short provider ID (e.g. `litellm`, `vllm`, `azure`) and protocol (`openai`, `anthropic`, or `gemini`)",
-        "Provide Base URL (e.g. `https://api.example.com/v1`) and Default Model ID",
+        "Enter a short provider ID (e.g. `litellm`, `vllm`, `together`) and protocol (`openai`, `anthropic`, or `gemini`)",
+        "Provide Base URL and optional API Key — leave Default Model blank to auto-probe live models",
       ],
-      callout: "API Key is optional for local endpoints (e.g. vLLM / LM Studio / Ollama).",
+      callout: "API Key is optional for local endpoints (vLLM / LM Studio / Ollama). Models are auto-probed on save.",
       fields: existing
         ? [
             { id: "name", label: "Display Name", initialValue: existing.name, placeholder: "My Custom Provider", validate: (v) => (!v ? "Enter a name." : null) },
             { id: "protocol", label: "Protocol (openai | anthropic | gemini)", initialValue: existing.protocol, placeholder: "openai", validate: (v) => (!["openai", "anthropic", "gemini"].includes(v.toLowerCase()) ? "Must be openai, anthropic, or gemini." : null) },
             { id: "baseUrl", label: "Base URL", initialValue: existing.baseUrl, placeholder: "https://api.example.com/v1", validate: (v) => (!/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null) },
             { id: "apiKey", label: "API Key (leave blank to keep existing)", placeholder: "Optional", secret: true },
-            { id: "defaultModel", label: "Default Model ID", initialValue: existing.defaultModel, placeholder: "gpt-4o", validate: (v) => (!v ? "Enter a default model ID." : null) },
+            { id: "defaultModel", label: "Default Model ID (leave blank to auto-probe)", initialValue: existing.defaultModel, placeholder: "Auto-probe or enter model ID" },
             { id: "models", label: "Additional Models (comma-separated, optional)", initialValue: existingExtra, placeholder: "model-a, model-b" },
           ]
         : [
-            { id: "id", label: "Provider ID", placeholder: "my-vllm", validate: (v) => (!/^[a-z0-9_-]{2,}$/i.test(v) ? "Use 2+ alphanumeric, dash, or underscore chars." : null) },
-            { id: "name", label: "Display Name", placeholder: "My Custom Endpoint", validate: (v) => (!v ? "Enter a display name." : null) },
-            { id: "protocol", label: "Protocol (openai | anthropic | gemini)", initialValue: "openai", placeholder: "openai", validate: (v) => (!["openai", "anthropic", "gemini"].includes(v.toLowerCase()) ? "Must be openai, anthropic, or gemini." : null) },
-            { id: "baseUrl", label: "Base URL", placeholder: "https://api.example.com/v1", validate: (v) => (!/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null) },
+            { id: "id", label: "Provider ID", initialValue: preset?.id ?? "", placeholder: "my-vllm", validate: (v) => (!/^[a-z0-9_-]{2,}$/i.test(v) ? "Use 2+ alphanumeric, dash, or underscore chars." : null) },
+            { id: "name", label: "Display Name", initialValue: preset?.name ?? "", placeholder: "My Custom Endpoint", validate: (v) => (!v ? "Enter a display name." : null) },
+            { id: "protocol", label: "Protocol (openai | anthropic | gemini)", initialValue: preset?.protocol ?? "openai", placeholder: "openai", validate: (v) => (!["openai", "anthropic", "gemini"].includes(v.toLowerCase()) ? "Must be openai, anthropic, or gemini." : null) },
+            { id: "baseUrl", label: "Base URL", initialValue: preset?.baseUrl ?? "", placeholder: "https://api.example.com/v1", validate: (v) => (!/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null) },
             { id: "apiKey", label: "API Key (optional for local)", placeholder: "sk-... (leave blank if none)", secret: true },
-            { id: "defaultModel", label: "Default Model ID", placeholder: "gpt-4o", validate: (v) => (!v ? "Enter a default model ID." : null) },
+            { id: "defaultModel", label: "Default Model ID (leave blank to auto-probe)", initialValue: preset?.model ?? "", placeholder: "Leave blank to probe /models automatically" },
             { id: "models", label: "Additional Models (comma-separated, optional)", placeholder: "model-a, model-b" },
           ],
     });
     if (form.action !== "submit") return false;
+    const proto = form.values.protocol.toLowerCase() as ProviderProtocol;
+    let defaultModel = (form.values.defaultModel || "").trim();
     const extraModels = (form.values.models || "")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-    const proto = form.values.protocol.toLowerCase() as ProviderProtocol;
+
+    // Auto-probe endpoint when default model is blank (matches WebUI "Test & Fetch Models")
+    if (!defaultModel) {
+      let probed: { models: Array<{ id: string; name: string }>; live: boolean; error?: string };
+      if (this.fullScreenActive) {
+        this.startSpinnerFs(`Probing ${form.values.baseUrl} for live models`);
+        try {
+          probed = await probeCustomEndpointModels({
+            protocol: proto,
+            baseUrl: form.values.baseUrl,
+            apiKey: form.values.apiKey || existing?.apiKey,
+          });
+        } finally {
+          this.stopSpinnerFs();
+        }
+      } else {
+        const spin = new TerminalSpinner();
+        spin.start(`Probing ${form.values.baseUrl} for live models`);
+        try {
+          probed = await probeCustomEndpointModels({
+            protocol: proto,
+            baseUrl: form.values.baseUrl,
+            apiKey: form.values.apiKey || existing?.apiKey,
+          });
+        } finally {
+          spin.stop();
+        }
+      }
+
+      if (probed.live && probed.models.length > 0) {
+        const picked = await this.runSelectModal({
+          title: "Select Default Model",
+          subtitle: `${probed.models.length} live model(s) discovered`,
+          placeholder: "Filter probed models…",
+          options: probed.models.map((m) => ({
+            value: m.id,
+            label: m.name,
+            description: m.id,
+            badge: "live",
+            badgeColor: PALETTE.success,
+            keywords: `${m.id} ${m.name}`,
+          })),
+          footerHints: "↑↓ move · ↵ pick default model · esc use first",
+        });
+        defaultModel = picked.action === "select" ? picked.value : probed.models[0].id;
+        for (const m of probed.models.slice(0, 12)) {
+          if (m.id !== defaultModel && !extraModels.includes(m.id)) {
+            extraModels.push(m.id);
+          }
+        }
+      } else {
+        defaultModel = "default";
+      }
+    }
+
     if (existing) {
       const updated = this.engine.updateCustomProvider(existing.id, {
         name: form.values.name,
         protocol: proto,
         baseUrl: form.values.baseUrl,
         apiKey: form.values.apiKey || undefined,
-        defaultModel: form.values.defaultModel,
+        defaultModel,
         models: extraModels,
       });
       await this.syncAndPrintConnectedProvider(updated);
@@ -3124,7 +3918,7 @@ export class YedoguTui {
       protocol: proto,
       baseUrl: form.values.baseUrl,
       apiKey: form.values.apiKey || undefined,
-      defaultModel: form.values.defaultModel,
+      defaultModel,
       models: extraModels,
     });
     this.engine.setModel(`${created.id}/${created.defaultModel}`);
@@ -3354,17 +4148,44 @@ export class YedoguTui {
     const escHint = canGoBack ? "esc back" : "esc close";
 
     const promptAndSaveApiKey = async (current: ProviderConfig, backLabel: string): Promise<"saved" | "back"> => {
-      const envHint = current.envKeys.length ? `env: ${current.envKeys[0]}` : current.baseUrl;
-      const keyRes = await this.runInputModal({
-        title: isProviderConnected(current) ? `Update ${current.name} API Key` : `Connect ${current.name}`,
+      const envHint = current.envKeys.length ? `Or set env var: ${current.envKeys[0]}` : "Local or custom endpoint";
+      const formRes = await this.runFormModal({
+        title: isProviderConnected(current) ? `Configure ${current.name}` : `Connect ${current.name}`,
         subtitle: `${current.id} · ${backLabel}`,
-        placeholder: current.local ? "Optional token or press Enter" : "Paste API key…",
-        secret: !current.local,
-        hint: `Default model: ${current.id}/${current.defaultModel} · ${envHint}`,
-        validate: (val) => (!current.local && val.length < 4 ? "API key looks too short." : null),
+        callout: `Default model: ${current.id}/${current.defaultModel} · ${envHint}`,
+        fields: [
+          {
+            id: "apiKey",
+            label: current.local ? "API Key (optional for local)" : "API Key",
+            placeholder: isProviderConnected(current)
+              ? "Paste new key to replace (or leave blank to keep)"
+              : current.local
+                ? "Optional token or press Enter"
+                : "Paste API key…",
+            secret: !current.local,
+            validate: (val) =>
+              !current.local && !isProviderConnected(current) && val.length < 4
+                ? "API key looks too short."
+                : null,
+          },
+          {
+            id: "baseUrl",
+            label: "Base URL Override (optional)",
+            initialValue: current.baseUrl,
+            placeholder: current.baseUrl || "https://api.example.com/v1",
+            validate: (val) => (val && !/^https?:\/\//i.test(val) ? "Enter a valid http(s) URL." : null),
+          },
+        ],
       });
-      if (keyRes.action !== "submit") return "back";
-      const updated = this.engine.connectProvider(current.id, keyRes.value || "local");
+      if (formRes.action !== "submit") return "back";
+      const effectiveKey =
+        formRes.values.apiKey ||
+        (isProviderConnected(current) ? current.apiKey || "local-no-key-required" : "local-no-key-required");
+      const effectiveBaseUrl =
+        formRes.values.baseUrl && formRes.values.baseUrl !== current.baseUrl
+          ? formRes.values.baseUrl
+          : formRes.values.baseUrl || undefined;
+      const updated = this.engine.connectProvider(current.id, effectiveKey, effectiveBaseUrl);
       await this.syncAndPrintConnectedProvider(updated);
       return "saved";
     };
@@ -3385,6 +4206,26 @@ export class YedoguTui {
       const isAgyAuth = current.authSource === "agy-cli";
 
       const actionOptions: SelectOption<string>[] = [];
+      if (connected && current.models.length > 0) {
+        actionOptions.push({
+          value: "browse-models",
+          label: `Browse & Select Models (${current.models.length} available)`,
+          description: current.models.slice(0, 3).map((m) => m.name).join(", "),
+          badge: "Models",
+          badgeColor: PALETTE.accent,
+          keywords: "models select switch pick browse",
+        });
+      }
+      if (connected) {
+        actionOptions.push({
+          value: "sync",
+          label: "↻ Sync / Refresh Live Models",
+          description: `Fetch latest models from ${current.baseUrl}`,
+          badge: "Sync",
+          badgeColor: PALETTE.info,
+          keywords: "refresh sync reload models live",
+        });
+      }
       if (cliSpec) {
         actionOptions.push({
           value: "cli",
@@ -3397,13 +4238,13 @@ export class YedoguTui {
       }
       actionOptions.push({
         value: "apikey",
-        label: connected ? "Update Saved API Key" : "Paste API Key",
+        label: connected ? "Configure API Key & Base URL" : "Connect with API Key / Base URL",
         description: cliSpec
-          ? `Direct API key (${cliSpec.keyUrl})`
-          : `Save API key or token for ${current.name}`,
+          ? `Direct API key & endpoint (${cliSpec.keyUrl})`
+          : `Save API key or custom Base URL for ${current.name}`,
         badge: "Key",
         badgeColor: PALETTE.success,
-        keywords: "api key token paste update",
+        keywords: "api key token paste update base url endpoint configure",
       });
       if (cliSpec) {
         actionOptions.push({
@@ -3468,6 +4309,16 @@ export class YedoguTui {
 
       if (methodRes.action !== "select") {
         return canGoBack ? "back" : "cancel";
+      }
+
+      if (methodRes.value === "browse-models") {
+        await this.openModelPicker(current.id);
+        return "done";
+      }
+
+      if (methodRes.value === "sync") {
+        await this.syncAndPrintConnectedProvider(current);
+        continue;
       }
 
       if (methodRes.value === "cli" && cliSpec) {
@@ -3956,6 +4807,12 @@ export class YedoguTui {
               placeholder: "Leave blank to auto-generate",
               secret: true,
             },
+            {
+              id: "callbackUrl",
+              label: "Outbound Callback URL (optional)",
+              placeholder: "https://bridge.example.com/reply (optional)",
+              validate: (v) => (v && !/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null),
+            },
           ],
         });
         if (form.action !== "submit") continue;
@@ -3963,6 +4820,7 @@ export class YedoguTui {
           platform: "webhook",
           name: form.values.name || "Webhook Bridge",
           token: form.values.token || undefined,
+          callbackUrl: form.values.callbackUrl || undefined,
         });
         return;
       }
@@ -3978,21 +4836,25 @@ export class YedoguTui {
     platform: "telegram" | "discord" | "slack" | "webhook";
     token?: string;
     appToken?: string;
+    callbackUrl?: string;
+    defaultAgent?: string;
     name: string;
   }): Promise<void> {
     const created = this.engine.channels.upsertChannel({
       platform: input.platform,
       token: input.token,
       appToken: input.appToken,
+      callbackUrl: input.callbackUrl,
+      defaultAgent: input.defaultAgent,
       name: input.name,
       autoStart: true,
     });
     const rawCfg = this.engine.channels.getConfig(created.id);
 
-    this.spinner.start(`Connecting ${input.platform} bot…`);
+    this.startSpinnerFs(`Connecting ${input.platform} bot…`);
     try {
       const live = await this.engine.channels.startChannel(created.id);
-      this.spinner.stop(true);
+      this.stopSpinnerFs();
       // Auto-label with real bot handle when using default placeholder name
       if (
         rawCfg &&
@@ -4011,7 +4873,7 @@ export class YedoguTui {
         ),
       );
     } catch (err) {
-      this.spinner.stop(true);
+      this.stopSpinnerFs();
       process.stdout.write(
         `\n  ${c(PALETTE.danger + PALETTE.bold, "✗ Connection failed:")} ${c(PALETTE.text, err instanceof Error ? err.message : String(err))}\n`,
       );
@@ -4030,10 +4892,17 @@ export class YedoguTui {
       },
       {
         value: "pair",
-        label: "Generate New One-Time Pairing Code",
+        label: "Generate / Rotate One-Time Pairing Code",
         description: ch.pairingCode ? `Current: /pair ${ch.pairingCode}` : "Let a user self-authorize via /pair <CODE>",
         badge: "pair",
         badgeColor: PALETTE.accent,
+      },
+      {
+        value: "pin-agent",
+        label: "Pin Default Specialist @Agent",
+        description: ch.defaultAgent ? `Currently pinned to @${ch.defaultAgent}` : "Currently uses active session agent",
+        badge: ch.defaultAgent ? `@${ch.defaultAgent}` : "active",
+        badgeColor: PALETTE.accentSoft,
       },
       {
         value: "allow-user",
@@ -4042,6 +4911,17 @@ export class YedoguTui {
         badge: "allow",
         badgeColor: PALETTE.success,
       },
+      ...(ch.allowedUsers.length > 0
+        ? [
+            {
+              value: "remove-user",
+              label: "− Remove Allowed User ID…",
+              description: `${ch.allowedUsers.length} authorized user(s)`,
+              badge: "revoke",
+              badgeColor: PALETTE.warning,
+            },
+          ]
+        : []),
       {
         value: "allow-chat",
         label: "+ Allow Chat / Channel ID…",
@@ -4049,6 +4929,17 @@ export class YedoguTui {
         badge: "chat",
         badgeColor: PALETTE.info,
       },
+      ...(ch.allowedChats.length > 0
+        ? [
+            {
+              value: "remove-chat",
+              label: "− Remove Allowed Chat ID…",
+              description: `${ch.allowedChats.length} authorized chat(s)`,
+              badge: "revoke",
+              badgeColor: PALETTE.warning,
+            },
+          ]
+        : []),
       {
         value: "toggle-all",
         label: ch.allowAll ? "Disable Allow-All (Enforce Allowlist)" : "Enable Allow-All (Not Recommended)",
@@ -4075,15 +4966,15 @@ export class YedoguTui {
     if (res.action !== "select") return false;
 
     if (res.value === "start") {
-      this.spinner.start(`Connecting ${ch.name}…`);
+      this.startSpinnerFs(`Connecting ${ch.name}…`);
       try {
         const live = await this.engine.channels.startChannel(ch.id);
-        this.spinner.stop(true);
+        this.stopSpinnerFs();
         process.stdout.write(
           `\n  ${c(PALETTE.success, "✓")} Connected ${c(PALETTE.text + PALETTE.bold, live.name)} ${c(PALETTE.info, live.status.botUsername || "")}\n`,
         );
       } catch (err) {
-        this.spinner.stop(true);
+        this.stopSpinnerFs();
         process.stdout.write(
           `\n  ${c(PALETTE.danger, "✗")} ${c(PALETTE.text, err instanceof Error ? err.message : String(err))}\n`,
         );
@@ -4096,6 +4987,38 @@ export class YedoguTui {
       process.stdout.write(
         `\n  ${c(PALETTE.success, "✓")} New pairing code for ${c(PALETTE.text + PALETTE.bold, ch.name)}: text ${c(PALETTE.accent + PALETTE.bold, `/pair ${code}`)} to your bot.\n`,
       );
+    } else if (res.value === "pin-agent") {
+      const agents = this.engine.getAgents();
+      const pick = await this.runSelectModal({
+        title: `Pin Agent for ${ch.name}`,
+        subtitle: ch.defaultAgent ? `Current: @${ch.defaultAgent}` : "Active session agent",
+        options: [
+          {
+            value: "",
+            label: "Use Active Session Agent",
+            description: "Follow whichever agent is active in YEDOGU",
+            badge: !ch.defaultAgent ? "active" : "auto",
+            active: !ch.defaultAgent,
+            checked: !ch.defaultAgent,
+          },
+          ...agents.map((a) => ({
+            value: a.id,
+            label: `@${a.id}`,
+            description: a.title,
+            badge: ch.defaultAgent === a.id ? "pinned" : undefined,
+            badgeColor: PALETTE.accent,
+            active: ch.defaultAgent === a.id,
+            checked: ch.defaultAgent === a.id,
+          })),
+        ],
+        footerHints: "↑↓ move · ↵ set agent · esc back",
+      });
+      if (pick.action === "select") {
+        this.engine.channels.updateAccessControl(ch.id, { defaultAgent: pick.value });
+        process.stdout.write(
+          `\n  ${c(PALETTE.success, "✓")} Channel ${c(PALETTE.text, ch.name)} default agent → ${c(PALETTE.accent, pick.value ? `@${pick.value}` : "active session agent")}\n`,
+        );
+      }
     } else if (res.value === "allow-user") {
       const inp = await this.runInputModal({
         title: "Allow Sender User ID",
@@ -4107,6 +5030,17 @@ export class YedoguTui {
         this.engine.channels.updateAccessControl(ch.id, { addUser: inp.value });
         process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Authorized user ${c(PALETTE.info, inp.value)} on ${ch.name}\n`);
       }
+    } else if (res.value === "remove-user") {
+      const pick = await this.runSelectModal({
+        title: "Remove Allowed User ID",
+        subtitle: ch.name,
+        options: ch.allowedUsers.map((u) => ({ value: u, label: u, badge: "remove", badgeColor: PALETTE.danger })),
+        footerHints: "↑↓ move · ↵ remove · esc back",
+      });
+      if (pick.action === "select") {
+        this.engine.channels.updateAccessControl(ch.id, { removeUser: pick.value });
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Removed user ${c(PALETTE.info, pick.value)} from ${ch.name}\n`);
+      }
     } else if (res.value === "allow-chat") {
       const inp = await this.runInputModal({
         title: "Allow Chat / Channel ID",
@@ -4117,6 +5051,17 @@ export class YedoguTui {
       if (inp.action === "submit") {
         this.engine.channels.updateAccessControl(ch.id, { addChat: inp.value });
         process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Authorized chat ${c(PALETTE.info, inp.value)} on ${ch.name}\n`);
+      }
+    } else if (res.value === "remove-chat") {
+      const pick = await this.runSelectModal({
+        title: "Remove Allowed Chat ID",
+        subtitle: ch.name,
+        options: ch.allowedChats.map((cid) => ({ value: cid, label: cid, badge: "remove", badgeColor: PALETTE.danger })),
+        footerHints: "↑↓ move · ↵ remove · esc back",
+      });
+      if (pick.action === "select") {
+        this.engine.channels.updateAccessControl(ch.id, { removeChat: pick.value });
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Removed chat ${c(PALETTE.info, pick.value)} from ${ch.name}\n`);
       }
     } else if (res.value === "toggle-all") {
       const next = !ch.allowAll;

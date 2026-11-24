@@ -1807,3 +1807,151 @@ test("takeVisiblePrefix, clipVisible, and compositeOverlay preserve exact alignm
     }
   }
 });
+
+test("TUI and WebUI share favorite models, per-agent model pin reset, live local Ollama connection, and SelectModal onKey hooks", async () => {
+  // 1. Live-detected local Ollama counts as connected for both TUI and WebUI
+  const builtins = getBuiltinProviders();
+  const ollama = builtins.find((p) => p.id === "ollama")!;
+  assert.equal(
+    isProviderConnected({
+      ...ollama,
+      apiKey: "local-no-key-required",
+      authSource: "local",
+      models: [{ id: "qwen2.5-coder:32b", name: "Qwen 2.5 Coder 32B", contextWindow: 65536, supportsTools: true, tags: ["local", "live", "detected"] }],
+    }),
+    true,
+  );
+
+  // 2. Shared favorite models + agent pin reset over Daemon API & Engine
+  const engine = new YedoguEngine(process.cwd());
+  const prevConfig = structuredClone(engine.config);
+  const daemon = new YedoguDaemon(engine);
+  const url = await daemon.start(0, "127.0.0.1");
+  try {
+    const favKey = "openai::gpt-5";
+    const r1 = await fetch(`${url}/api/models/favorite`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: favKey }),
+    });
+    assert.equal(r1.status, 200);
+    const d1 = (await r1.json()) as any;
+    assert.ok(d1.favoriteModels.includes(favKey));
+    assert.ok(engine.getFavoriteModels().includes(favKey));
+
+    const snap = await engine.getSnapshot();
+    assert.ok(snap.favoriteModels.includes(favKey));
+
+    // Toggle off
+    const r2 = await fetch(`${url}/api/models/favorite`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ key: favKey }),
+    });
+    assert.equal(r2.status, 200);
+    assert.equal(engine.getFavoriteModels().includes(favKey), false);
+
+    // Pin and clear agent model
+    engine.setModel("openai/gpt-5", "recon");
+    assert.equal(engine.session.agentModels.recon, "openai/gpt-5");
+    const clr = await fetch(`${url}/api/model`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: "recon", model: "" }),
+    });
+    assert.equal(clr.status, 200);
+    assert.equal(engine.session.agentModels.recon, undefined);
+    assert.equal(engine.config.agentModels.recon, undefined);
+  } finally {
+    engine.config = prevConfig;
+    saveGlobalConfig(prevConfig);
+    await daemon.stop();
+  }
+
+  // 3. SelectModal onKey handles Ctrl+F filter cycling and closeWith cleanly
+  let modalOutcome: any = null;
+  let filterIdx = 0;
+  const fakeOut = { isTTY: false, columns: 80, rows: 24, write: () => true } as unknown as NodeJS.WriteStream;
+  const modal = new SelectModal(
+    {
+      title: "Switch Model",
+      options: [
+        { value: "openai/gpt-5", label: "GPT-5" },
+        { value: "anthropic/claude-opus-4-6", label: "Claude Opus 4.6" },
+      ],
+      onKey: (_str, key) => {
+        if (key.ctrl && key.name === "f") {
+          filterIdx++;
+          return { options: [{ value: "anthropic/claude-opus-4-6", label: "Claude Opus 4.6" }] };
+        }
+        if (key.ctrl && key.name === "r") {
+          return {
+            closeWith: {
+              action: "select",
+              value: "__refresh__",
+              option: { value: "__refresh__", label: "Refresh" },
+            },
+          };
+        }
+        return false;
+      },
+    },
+    (res) => {
+      modalOutcome = res;
+    },
+    fakeOut,
+  );
+  modal.open();
+  assert.equal(modal.currentFiltered.length, 2);
+  modal.handleKey("", { ctrl: true, name: "f" });
+  assert.equal(filterIdx, 1);
+  assert.equal(modal.currentFiltered.length, 1);
+  modal.handleKey("", { ctrl: true, name: "r" });
+  assert.equal(modalOutcome?.action, "select");
+  assert.equal(modalOutcome?.value, "__refresh__");
+});
+
+test("renderOpenCodeModal decouples scrollTop from selectedIndex, renders continuous scrollbar, and maps option rows for mouse click", () => {
+  const options = [
+    { value: "m1", label: "Model 1", category: "OpenAI" },
+    { value: "m2", label: "Model 2", category: "OpenAI" },
+    { value: "m3", label: "Model 3", category: "OpenAI" },
+    { value: "m4", label: "Model 4", category: "Anthropic" },
+    { value: "m5", label: "Model 5", category: "Anthropic" },
+    { value: "m6", label: "Model 6", category: "Anthropic" },
+    { value: "m7", label: "Model 7", category: "Gemini" },
+    { value: "m8", label: "Model 8", category: "Gemini" },
+  ];
+
+  // Scroll down to scrollTop=5 while selectedIndex remains 0
+  const scrolled = renderOpenCodeModal({
+    title: "Switch Model",
+    width: 60,
+    maxRows: 5,
+    options,
+    selectedIndex: 0,
+    scrollTop: 5,
+  });
+
+  assert.equal(scrolled.scrollTop, 5);
+  assert.ok(scrolled.maxScrollTop > 0);
+  assert.equal(scrolled.scrollbarHeight, 5);
+  assert.ok(scrolled.scrollbarRowOffset !== undefined);
+
+  // Every visible row in the list viewport has a scrollbar character (`┃` or `│`)
+  for (let i = 0; i < scrolled.scrollbarHeight!; i++) {
+    const plain = stripAnsi(scrolled.lines[scrolled.scrollbarRowOffset! + i]);
+    assert.ok(plain.includes("┃") || plain.includes("│"), `Missing scrollbar on row ${i}: ${plain}`);
+  }
+
+  // Model 1 (selectedIndex 0) is scrolled out of view — scrolling did NOT change selection to a visible item
+  const visibleOptionIndices = scrolled.optionRowOffsets.map((e) => e.optionIndex);
+  assert.ok(!visibleOptionIndices.includes(0));
+  assert.ok(visibleOptionIndices.length > 0);
+
+  // Hit-map points to the exact rendered option label on each row
+  for (const entry of scrolled.optionRowOffsets) {
+    const rowPlain = stripAnsi(scrolled.lines[entry.rowOffset]);
+    assert.ok(rowPlain.includes(options[entry.optionIndex].label));
+  }
+});

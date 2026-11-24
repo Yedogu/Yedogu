@@ -3082,15 +3082,22 @@ const EFFORT_FULL_LABELS = { none: "Off", low: "Low", medium: "Medium", high: "H
 const EFFORT_ORDER_UI = ["none", "low", "medium", "high", "xhigh"];
 
 function getFavoriteModels() {
+  if (Array.isArray(STATE?.favoriteModels)) return STATE.favoriteModels;
   try { return JSON.parse(localStorage.getItem("yedogu.favoriteModels") || "[]"); } catch { return []; }
 }
-function toggleFavoriteModel(key, e) {
+async function toggleFavoriteModel(key, e) {
   if (e) e.stopPropagation();
+  const normKey = String(key || "").trim().toLowerCase();
   const favs = new Set(getFavoriteModels());
-  if (favs.has(key)) favs.delete(key);
-  else favs.add(key);
-  try { localStorage.setItem("yedogu.favoriteModels", JSON.stringify([...favs])); } catch {}
+  if (favs.has(normKey)) favs.delete(normKey);
+  else favs.add(normKey);
+  const next = [...favs];
+  if (STATE) STATE.favoriteModels = next;
+  try { localStorage.setItem("yedogu.favoriteModels", JSON.stringify(next)); } catch {}
   renderModelPickerList();
+  try {
+    await api("/api/models/favorite", { method: "POST", body: { key: normKey } });
+  } catch {}
 }
 
 function resolveBrandForIcon(pid, modelId) {
@@ -5667,9 +5674,8 @@ async function saveCustomProviderUi() {
 }
 
 async function pinAgentModel(agentId, model) {
-  if (!model) return;
-  await api("/api/model", { method: "POST", body: { agentId, model } });
-  toast("Pinned @" + agentId + " → " + formatModelBadge(model));
+  await api("/api/model", { method: "POST", body: { agentId, model: model || "" } });
+  toast(model ? ("Pinned @" + agentId + " → " + formatModelBadge(model)) : ("Reset @" + agentId + " to default model"));
   refreshState();
 }
 

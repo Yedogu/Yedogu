@@ -12,7 +12,11 @@ import type { ProviderConfig, ProviderModelInfo, ProviderProtocol, ReasoningEffo
 export function isProviderConnected(provider: ProviderConfig): boolean {
   if (!provider.apiKey) return false;
   if (provider.local) {
-    return provider.authSource === "config" || provider.authSource === "env";
+    return (
+      provider.authSource === "config" ||
+      provider.authSource === "env" ||
+      provider.models.some((m) => m.tags?.includes("live") || m.tags?.includes("detected"))
+    );
   }
   return true;
 }

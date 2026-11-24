@@ -16,6 +16,7 @@ import {
 } from "../config/store.js";
 import {
   fetchProviderModels,
+  formatModelDisplayName,
   isProviderConnected,
   parseModelSpec,
   pickBestDefaultModel,
@@ -143,7 +144,7 @@ export class YedoguEngine extends EventEmitter {
   public getProviders(): ProviderConfig[] {
     return resolveProviders(this.config).map((p) => {
       const live = this.liveModelsCache.get(p.id);
-      if (live && live.length > 0 && isProviderConnected(p)) {
+      if (live && live.length > 0 && (isProviderConnected(p) || p.local)) {
         const models = p.custom
           ? [...new Map([...p.models, ...live].map((m) => [m.id, m])).values()]
           : [...live];
@@ -157,15 +158,42 @@ export class YedoguEngine extends EventEmitter {
     return this.getProviders().filter(isProviderConnected);
   }
 
+  public getProviderLiveMeta(
+    providerId: string,
+  ): { live: boolean; error?: string; updatedAt: string } | undefined {
+    return this.liveModelsMeta.get(providerId.toLowerCase());
+  }
+
   public async refreshProviderModels(
     providerId?: string,
   ): Promise<Array<{ providerId: string; count: number; live: boolean; error?: string }>> {
+    const allProviders = this.getProviders();
     const targets = providerId
-      ? this.getProviders().filter((p) => p.id === providerId.toLowerCase() && isProviderConnected(p))
-      : this.getConnectedProviders();
+      ? allProviders.filter((p) => p.id === providerId.toLowerCase() && (isProviderConnected(p) || p.local))
+      : allProviders.filter((p) => isProviderConnected(p) || p.id === "ollama");
 
     const results = await Promise.all(
       targets.map(async (p) => {
+        if (p.id === "ollama") {
+          const ollamaNames = await probeLocalOllamaModels(p.baseUrl);
+          if (ollamaNames.length > 0) {
+            const liveModels: ProviderModelInfo[] = ollamaNames.map((id) => ({
+              id,
+              name: formatModelDisplayName(id),
+              contextWindow: 65536,
+              supportsTools: true,
+              supportsReasoning: /r1|qwq|thinking|reasoning/i.test(id),
+              tags: ["local", "live", "detected"],
+            }));
+            this.liveModelsCache.set("ollama", liveModels);
+            this.liveModelsMeta.set("ollama", { live: true, updatedAt: new Date().toISOString() });
+            return { providerId: "ollama", count: liveModels.length, live: true };
+          }
+          if (!isProviderConnected(p)) {
+            this.liveModelsCache.delete("ollama");
+            return { providerId: "ollama", count: 0, live: false };
+          }
+        }
         const customConfig = this.config.customProviders.find((configured) => configured.id === p.id);
         const res = await fetchProviderModels(p);
         if (p.custom && customConfig !== this.config.customProviders.find((configured) => configured.id === p.id)) {
@@ -255,6 +283,15 @@ export class YedoguEngine extends EventEmitter {
     return normalized;
   }
 
+  public clearAgentModel(agentId: string): void {
+    const clean = agentId.replace(/^@/, "").toLowerCase();
+    delete this.session.agentModels[clean];
+    delete this.config.agentModels[clean];
+    saveGlobalConfig(this.config);
+    this.persist();
+    this.emitEvent("model.changed", { model: this.session.activeModel, agentId: clean, cleared: true });
+  }
+
   public setReasoningEffort(effort: ReasoningEffort): ReasoningEffort {
     const allowed: ReasoningEffort[] = ["none", "low", "medium", "high", "xhigh"];
     const normalized = allowed.includes(effort) ? effort : "medium";
@@ -268,6 +305,22 @@ export class YedoguEngine extends EventEmitter {
       agentId: null,
     });
     return normalized;
+  }
+
+  public getFavoriteModels(): string[] {
+    return Array.isArray(this.config.favoriteModels) ? [...this.config.favoriteModels] : [];
+  }
+
+  public toggleFavoriteModel(key: string): string[] {
+    const clean = key.trim().toLowerCase();
+    if (!clean) return this.getFavoriteModels();
+    const set = new Set(this.getFavoriteModels());
+    if (set.has(clean)) set.delete(clean);
+    else set.add(clean);
+    this.config.favoriteModels = [...set];
+    saveGlobalConfig(this.config);
+    this.emitEvent("model.changed", { favoriteModels: this.config.favoriteModels });
+    return [...this.config.favoriteModels];
   }
 
   public connectProvider(providerId: string, apiKey: string, baseUrl?: string): ProviderConfig {
@@ -1184,17 +1237,20 @@ RUNTIME CONTEXT:
     const ollamaModels = await probeLocalOllamaModels();
     const ollama = providers.find((p) => p.id === "ollama");
     if (ollama && ollamaModels.length > 0) {
-      ollama.connected = true;
-      ollama.liveStatus = "live";
-      ollama.liveError = undefined;
-      ollama.models = ollamaModels.map((m) => ({
+      const liveOllamaModels: ProviderModelInfo[] = ollamaModels.map((m) => ({
         id: m,
-        name: m,
+        name: formatModelDisplayName(m),
         contextWindow: 65536,
         supportsTools: true,
         supportsReasoning: /r1|qwq|thinking|reasoning/i.test(m),
-        tags: ["local", "detected"],
+        tags: ["local", "live", "detected"],
       }));
+      this.liveModelsCache.set("ollama", liveOllamaModels);
+      this.liveModelsMeta.set("ollama", { live: true, updatedAt: new Date().toISOString() });
+      ollama.connected = true;
+      ollama.liveStatus = "live";
+      ollama.liveError = undefined;
+      ollama.models = liveOllamaModels;
     }
 
     const projects = this.getProjects();
@@ -1209,6 +1265,7 @@ RUNTIME CONTEXT:
       daemonUrl: this.daemonUrl,
       theme: this.config.theme,
       reasoningEffort: this.session.reasoningEffort || this.config.reasoningEffort || "medium",
+      favoriteModels: this.getFavoriteModels(),
       session: this.session,
       sessions,
       projects,

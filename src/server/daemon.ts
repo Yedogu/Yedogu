@@ -431,13 +431,25 @@ export class YedoguDaemon {
     if (method === "POST" && pathname === "/api/model") {
       const body = await readJsonBody(req);
       const agentId = typeof body.agentId === "string" && body.agentId ? body.agentId : undefined;
-      const model = typeof body.model === "string" && body.model.trim()
-        ? this.engine.setModel(body.model, agentId)
-        : this.engine.session.activeModel;
+      let model = this.engine.session.activeModel;
+      if (agentId && body.model === "") {
+        this.engine.clearAgentModel(agentId);
+      } else if (typeof body.model === "string" && body.model.trim()) {
+        model = this.engine.setModel(body.model, agentId);
+      }
       const reasoningEffort = typeof body.reasoningEffort === "string" && body.reasoningEffort
         ? this.engine.setReasoningEffort(body.reasoningEffort as ReasoningEffort)
         : (this.engine.session.reasoningEffort || this.engine.config.reasoningEffort || "medium");
       sendJson(res, 200, { model, reasoningEffort, agentId: agentId || null });
+      return;
+    }
+
+    // Toggle Favorite Model (synced between Terminal TUI and WebUI)
+    if (method === "POST" && pathname === "/api/models/favorite") {
+      const body = await readJsonBody(req);
+      const key = String(body.key || "").trim();
+      const favoriteModels = this.engine.toggleFavoriteModel(key);
+      sendJson(res, 200, { favoriteModels });
       return;
     }
 

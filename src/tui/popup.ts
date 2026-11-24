@@ -25,6 +25,14 @@ export interface SelectOption<T = string> {
   keywords?: string;
 }
 
+export interface SelectModalPatch<T = string> {
+  subtitle?: string;
+  footerHints?: string;
+  options?: SelectOption<T>[];
+  selectedIndex?: number;
+  closeWith?: ModalOutcome<T>;
+}
+
 export interface SelectModalConfig<T = string> {
   title: string;
   subtitle?: string;
@@ -39,15 +47,20 @@ export interface SelectModalConfig<T = string> {
    * Optional Tab handler for in-modal mode toggling (e.g., Default vs Pin to @agent).
    * Returning partial updates refreshes the modal immediately in place.
    */
-  onTab?: () => {
-    subtitle?: string;
-    footerHints?: string;
-    options?: SelectOption<T>[];
-  } | void;
+  onTab?: () => SelectModalPatch<T> | void;
   /**
    * Optional Left/Right arrow handler (e.g., adjusting model reasoning effort).
    */
-  onLeftRight?: (delta: -1 | 1, selected: SelectOption<T> | undefined) => void;
+  onLeftRight?: (delta: -1 | 1, selected: SelectOption<T> | undefined) => SelectModalPatch<T> | void;
+  /**
+   * Optional custom key handler (e.g., Ctrl+F filter cycle, Ctrl+S favorite, Ctrl+R refresh).
+   * Return true or a SelectModalPatch to consume the keypress and refresh the modal.
+   */
+  onKey?: (
+    str: string,
+    key: readline.Key,
+    selected: SelectOption<T> | undefined,
+  ) => SelectModalPatch<T> | boolean | void;
   /**
    * Optional multi-line panel rendered below the option list (e.g., effort slider).
    */
@@ -279,29 +292,33 @@ export class SelectModal<T = string> implements ActiveModal {
     }
 
     if (key.name === "left" && this.config.onLeftRight) {
-      this.config.onLeftRight(-1, this.filtered[this.selectedIndex]);
-      this.render();
+      const patch = this.config.onLeftRight(-1, this.filtered[this.selectedIndex]);
+      if (patch) this.applyPatch(patch);
+      if (!this.closed) this.render();
       return;
     }
 
     if (key.name === "right" && this.config.onLeftRight) {
-      this.config.onLeftRight(1, this.filtered[this.selectedIndex]);
-      this.render();
+      const patch = this.config.onLeftRight(1, this.filtered[this.selectedIndex]);
+      if (patch) this.applyPatch(patch);
+      if (!this.closed) this.render();
       return;
     }
 
     if (key.name === "tab" && this.config.onTab) {
       const patch = this.config.onTab();
-      if (patch) {
-        if (patch.subtitle !== undefined) this.subtitle = patch.subtitle;
-        if (patch.footerHints !== undefined) this.footerHints = patch.footerHints;
-        if (patch.options) {
-          this.options = [...patch.options];
-          this.applyFilter();
-        }
-      }
-      this.render();
+      if (patch) this.applyPatch(patch);
+      if (!this.closed) this.render();
       return;
+    }
+
+    if (this.config.onKey) {
+      const handled = this.config.onKey(str, key, this.filtered[this.selectedIndex]);
+      if (handled) {
+        if (typeof handled === "object") this.applyPatch(handled);
+        if (!this.closed) this.render();
+        return;
+      }
     }
 
     if (this.config.searchable === false) return;
@@ -342,6 +359,23 @@ export class SelectModal<T = string> implements ActiveModal {
     const moveUp = this.renderedLines > 1 ? `\x1b[${this.renderedLines - 1}A` : "";
     this.out.write(`${SYNC_START}${moveUp}\r\x1b[J\x1b[1A\r\x1b[K${SYNC_END}`);
     this.renderedLines = 0;
+  }
+
+  private applyPatch(patch: SelectModalPatch<T>): void {
+    if (patch.closeWith) {
+      this.close();
+      this.onDone(patch.closeWith);
+      return;
+    }
+    if (patch.subtitle !== undefined) this.subtitle = patch.subtitle;
+    if (patch.footerHints !== undefined) this.footerHints = patch.footerHints;
+    if (patch.options) {
+      this.options = [...patch.options];
+      this.applyFilter();
+    }
+    if (patch.selectedIndex !== undefined && this.filtered.length > 0) {
+      this.selectedIndex = Math.max(0, Math.min(this.filtered.length - 1, patch.selectedIndex));
+    }
   }
 
   private applyFilter(): void {

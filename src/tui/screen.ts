@@ -266,13 +266,19 @@ export interface OpenCodeModalOptions<T = string> {
   query?: string;
   options: readonly OpenCodeModalOption<T>[];
   selectedIndex: number;
+  /**
+   * Independent viewport scroll offset (in visual list rows).
+   * When provided, scrolling moves only the viewport without changing `selectedIndex`.
+   */
+  scrollTop?: number;
   footerPanel?: string[];
   footerHint?: string;
 }
 
 /**
  * Renders OpenCode's exact floating borderless modal (`Connect an integration`, `Select model`, etc.)
- * with elevated `#161616` surface, category headers, green `✓` checkmarks, and full-width highlight bar.
+ * with elevated `#161616` surface, category headers, green `✓` checkmarks, full-width highlight bar,
+ * and a continuous right-edge draggable scrollbar.
  */
 export function renderOpenCodeModal<T>(opts: OpenCodeModalOptions<T>): {
   lines: string[];
@@ -280,6 +286,11 @@ export function renderOpenCodeModal<T>(opts: OpenCodeModalOptions<T>): {
   cursorColOffset?: number;
   scrollbarRowOffset?: number;
   scrollbarHeight?: number;
+  totalListRows: number;
+  maxScrollTop: number;
+  scrollTop: number;
+  selectedVisualRow: number;
+  optionRowOffsets: Array<{ rowOffset: number; optionIndex: number }>;
 } {
   const width = Math.max(44, opts.width);
   const innerW = width - 4;
@@ -312,41 +323,78 @@ export function renderOpenCodeModal<T>(opts: OpenCodeModalOptions<T>): {
 
   lines.push(paintSurfaceLine("", width, modalBg));
 
-  const maxVisible = Math.max(4, opts.maxRows ?? 12);
-  const total = opts.options.length;
-  let start = 0;
-  if (total > maxVisible) {
-    start = Math.max(0, Math.min(opts.selectedIndex - Math.floor(maxVisible / 2), total - maxVisible));
+  // Build flat visual rows (category headers + spacers + options) so the viewport height
+  // and right-edge scrollbar stay 100% continuous and stable while scrolling.
+  type VisualRow =
+    | { kind: "category"; label: string }
+    | { kind: "spacer" }
+    | { kind: "option"; optionIndex: number; opt: OpenCodeModalOption<T> };
+
+  const visualRows: VisualRow[] = [];
+  let selectedVisualRow = 0;
+  let lastCategory: string | undefined;
+  for (let idx = 0; idx < opts.options.length; idx++) {
+    const opt = opts.options[idx];
+    if (opt.category && opt.category !== lastCategory) {
+      if (lastCategory !== undefined) {
+        visualRows.push({ kind: "spacer" });
+      }
+      lastCategory = opt.category;
+      visualRows.push({ kind: "category", label: opt.category });
+    }
+    if (idx === opts.selectedIndex) {
+      selectedVisualRow = visualRows.length;
+    }
+    visualRows.push({ kind: "option", optionIndex: idx, opt });
   }
-  const slice = opts.options.slice(start, start + maxVisible);
-  const showScrollbar = total > maxVisible;
-  const scrollbar = showScrollbar ? renderScrollbarColumn(slice.length, total, start) : [];
+
+  const maxVisible = Math.max(4, opts.maxRows ?? 12);
+  const totalListRows = visualRows.length;
+  const viewportRows = totalListRows === 0 ? 0 : Math.min(totalListRows, maxVisible);
+  const maxScrollTop = Math.max(0, totalListRows - viewportRows);
+
+  let start = 0;
+  if (totalListRows > viewportRows) {
+    if (opts.scrollTop !== undefined) {
+      start = Math.max(0, Math.min(opts.scrollTop, maxScrollTop));
+    } else {
+      start = Math.max(0, Math.min(selectedVisualRow - Math.floor(viewportRows / 2), maxScrollTop));
+    }
+  }
+
+  const slice = visualRows.slice(start, start + viewportRows);
+  const scrollbar = viewportRows > 0 ? renderScrollbarColumn(viewportRows, totalListRows, start) : [];
   let scrollbarRowOffset: number | undefined;
   let scrollbarHeight: number | undefined;
+  const optionRowOffsets: Array<{ rowOffset: number; optionIndex: number }> = [];
 
   if (slice.length === 0) {
     lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, "No matching items")}`, width, modalBg));
   } else {
-    let lastCategory: string | undefined;
+    scrollbarRowOffset = lines.length;
+    scrollbarHeight = slice.length;
+
     for (let i = 0; i < slice.length; i++) {
-      const opt = slice[i];
-      const globalIdx = start + i;
-      const isSel = globalIdx === opts.selectedIndex;
+      const row = slice[i];
+      const sbChar = scrollbar[i] ?? c(PALETTE.borderSubtle, "│");
 
-      if (opt.category && opt.category !== lastCategory) {
-        if (lastCategory !== undefined) {
-          lines.push(paintSurfaceLine("", width, modalBg));
-        }
-        lastCategory = opt.category;
-        lines.push(paintSurfaceLine(`  ${c(PALETTE.muted + PALETTE.bold, opt.category)}`, width, modalBg));
+      if (row.kind === "spacer") {
+        const content = `${" ".repeat(Math.max(0, width - 4))}${sbChar}`;
+        lines.push(paintSurfaceLine(`  ${content}`, width, modalBg));
+        continue;
       }
 
-      if (showScrollbar && scrollbarRowOffset === undefined) {
-        scrollbarRowOffset = lines.length;
-        scrollbarHeight = slice.length;
+      if (row.kind === "category") {
+        const catStr = c(PALETTE.muted + PALETTE.bold, truncatePlain(row.label, Math.max(8, innerW - 2)));
+        const catGap = Math.max(1, width - 4 - visibleLength(catStr));
+        lines.push(paintSurfaceLine(`  ${catStr}${" ".repeat(catGap)}${sbChar}`, width, modalBg));
+        continue;
       }
 
-      const sbChar = showScrollbar ? scrollbar[i] : " ";
+      const opt = row.opt;
+      const isSel = row.optionIndex === opts.selectedIndex;
+      optionRowOffsets.push({ rowOffset: lines.length, optionIndex: row.optionIndex });
+
       const checkGlyph = opt.checked
         ? `${c(PALETTE.success + PALETTE.bold, "✓")} `
         : "  ";
@@ -387,7 +435,18 @@ export function renderOpenCodeModal<T>(opts: OpenCodeModalOptions<T>): {
 
   lines.push(paintSurfaceLine("", width, modalBg));
 
-  return { lines, cursorRowOffset, cursorColOffset, scrollbarRowOffset, scrollbarHeight };
+  return {
+    lines,
+    cursorRowOffset,
+    cursorColOffset,
+    scrollbarRowOffset,
+    scrollbarHeight,
+    totalListRows,
+    maxScrollTop,
+    scrollTop: start,
+    selectedVisualRow,
+    optionRowOffsets,
+  };
 }
 
 /**
