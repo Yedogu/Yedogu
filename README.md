@@ -3,7 +3,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="./logos/yedogunamelogo-dark.png">
   <source media="(prefers-color-scheme: light)" srcset="./logos/yedogunamelogo.png">
-  <img alt="YEDOGU" src="./logos/yedogunamelogo.png" width="420">
+  <img alt="Yedogu" src="./logos/yedogunamelogo.png" width="420">
 </picture>
 
 <h3>Offensive Security &amp; Reverse Engineering AI Harness</h3>
@@ -24,7 +24,7 @@
 
 ---
 
-**YEDOGU** is a purpose-built AI harness engineered specifically for hackers, bug bounty hunters, red teamers, exploit developers, and reverse engineers.
+**Yedogu** is a purpose-built AI harness engineered specifically for hackers, bug bounty hunters, red teamers, exploit developers, and reverse engineers.
 
 ## Core Capabilities
 
@@ -41,7 +41,7 @@
 
 | Agent | Specialty |
 | :--- | :--- |
-| `@commander` | Red-Team & Research Lead — orchestrates attack trees & parallel swarms |
+| `@commander` | Red-Team & Research Lead - orchestrates attack trees & parallel swarms |
 | `@recon` | OSINT, JS Bundle / Source-Map & Attack Surface Mapper |
 | `@web-hunter` | WAPT, Bug Bounty & API Exploitation Specialist |
 | `@reverser` | Native PE/ELF/Mach-O, APK/IPA, ASAR & REA MCP Reverse Engineer |
@@ -51,7 +51,7 @@
 | `@triage-report` | 7-Question Validation Gate, CVSS 3.1 & Sanitized Report Writer |
 
 ### Messaging Channels & Remote Bots (`/channels`)
-- Connect your own **Telegram Bot** (native Bot API long-polling), **Discord Bot** (Gateway v10 WebSocket), **Slack Bot** (Socket Mode), or **Generic Webhook Bridge** (`/api/channels/webhook/:id` for WhatsApp bridges, Matrix, n8n, iOS Shortcuts, or custom scripts) — with zero ngrok/tunneling required for Telegram, Discord, and Slack.
+- Connect your own **Telegram Bot** (native Bot API long-polling), **Discord Bot** (Gateway v10 WebSocket), **Slack Bot** (Socket Mode), or **Generic Webhook Bridge** (`/api/channels/webhook/:id` for WhatsApp bridges, Matrix, n8n, iOS Shortcuts, or custom scripts) - with zero ngrok/tunneling required for Telegram, Discord, and Slack.
 - Text the AI directly from your phone or chat app, route one-shot specialist tasks (`@recon`, `@web-hunter`, `@reverser`), and control sessions remotely (`/status`, `/agent`, `/model`, `/findings`, `/new`, `/abort`).
 - **Deny-by-default security** with one-time `/pair <CODE>` self-authorization and user/chat allowlists, plus live sync to your Terminal TUI and Browser War-Room.
 
@@ -81,7 +81,7 @@ npm link
 yedogu
 ```
 
-### Inside YEDOGU
+### Inside Yedogu
 
 ```text
 /providers                                           # Inspect connected providers (Codex, Claude, Gemini, Ollama...)
@@ -120,7 +120,7 @@ Yedogu/
 
 <div align="center">
 
-<img src="./logos/yedogulogo.png" alt="YEDOGU Icon" width="56">
+<img src="./logos/yedogulogo.png" alt="Yedogu Icon" width="56">
 
 <p><sub>Built for authorized offensive security research, bug bounty hunting, and reverse engineering.</sub></p>
 
