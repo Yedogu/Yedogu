@@ -119,6 +119,23 @@ Yedogu/
 
 ---
 
+## Contributing
+
+Contributions, bug fixes, new provider adapters, and security tool integrations are welcome.
+
+1. Fork the repository and create a feature branch (`git checkout -b feat/my-change`).
+2. Install dependencies and verify checks pass:
+   ```bash
+   npm install
+   npm run typecheck
+   npm test
+   ```
+3. Commit your changes and open a Pull Request.
+
+Read the full [Contributing Guide](./CONTRIBUTING.md) for architecture details, scope guardrail requirements, and testing conventions.
+
+---
+
 <div align="center">
 
 <img src="./logos/yedogulogo.png" alt="Yedogu Icon" width="56">
