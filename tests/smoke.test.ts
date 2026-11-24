@@ -19,7 +19,7 @@ import {
   formatFriendlyError,
 } from "../src/providers/errors.js";
 import { buildGeminiFunctionDeclarations } from "../src/providers/client.js";
-import { BUILTIN_TOOL_SCHEMAS } from "../src/tools/index.js";
+import { BUILTIN_TOOL_SCHEMAS, executeTool } from "../src/tools/index.js";
 import {
   fetchProviderModels,
   formatModelDisplayName,
@@ -48,22 +48,39 @@ import {
 } from "../src/tui/popup.js";
 import {
   PALETTE,
+  clipVisible,
   getActiveTheme,
   listThemes,
   renderCard,
   renderThemeSwatch,
+  renderYedoguEmblem,
+  renderYedoguLogo,
   setActiveTheme,
   stripAnsi,
   visibleLength,
 } from "../src/tui/theme.js";
+import {
+  compositeOverlay,
+  extractAndStripMouseSequences,
+  parseSgrMouseWheel,
+  renderOpenCodeModal,
+  renderOpenCodePromptBox,
+  renderScrollbarColumn,
+  takeVisiblePrefix,
+} from "../src/tui/screen.js";
+import { LeaderKeyController } from "../src/tui/keybinds.js";
 import { StreamMarkdownWriter } from "../src/tui/markdown.js";
 import {
   renderCheckGrid,
+  renderDiffView,
   renderGraphFrame,
   renderRankList,
   renderScoreDots,
   renderSeverityStack,
+  renderSidebarPanel,
   renderSpecRows,
+  renderSplitScreen,
+  renderTodoListCard,
   renderTree,
   renderUptimeStrip,
 } from "../src/tui/components.js";
@@ -1600,5 +1617,193 @@ test("Model display names, available-only filtering, reasoning effort API, probe
     saveGlobalConfig(prevConfig);
     await daemon.stop();
     await new Promise<void>((resolve) => srv.close(() => resolve()));
+  }
+});
+
+test("OpenCode 3D Yedogu logo, 35+ themes, LeaderKeyController, diff/todo/sidebar renderers, and fs_edit/todo_write work cleanly", async () => {
+  const prevTheme = getActiveTheme().id;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "yedogu-opencode-tui-"));
+  try {
+    // 1. 3D shaded colored YEDOGU logo
+    const logo = renderYedoguLogo(80, true);
+    const plainLogo = stripAnsi(logo);
+    assert.ok(plainLogo.includes("█") && plainLogo.includes("▀"));
+    assert.equal(logo.split("\n").length, 4);
+
+    // 2. All 35+ OpenCode themes registered and switchable
+    const themes = listThemes();
+    assert.ok(themes.length >= 35, `Expected >=35 themes, got ${themes.length}`);
+    for (const tid of ["opencode", "vesper", "matrix", "synthwave84", "carbonfox"]) {
+      const applied = setActiveTheme(tid);
+      assert.equal(applied.id, tid);
+    }
+
+    // 3. LeaderKeyController chord resolution
+    const leader = new LeaderKeyController(2000);
+    assert.equal(leader.isArmed, false);
+    leader.arm();
+    assert.equal(leader.isArmed, true);
+    assert.equal(leader.resolveChord("b", { name: "b" }), "sidebar_toggle");
+    assert.equal(leader.isArmed, false);
+    leader.arm();
+    assert.equal(leader.resolveChord("g", { name: "g" }), "session_timeline");
+    leader.arm();
+    assert.equal(leader.resolveChord("", { name: "escape" }), "cancel");
+
+    // 4. fs_edit and todo_write tools
+    const sampleFile = path.join(tmpDir, "target.ts");
+    fs.writeFileSync(sampleFile, "const auth = false;\nexport const mode = 'dev';\n", "utf8");
+    const engine = new YedoguEngine(tmpDir);
+    const editRes = await executeTool(
+      "fs_edit",
+      { path: "target.ts", oldText: "const auth = false;", newText: "const auth = true;" },
+      {
+        session: engine.session,
+        agent: engine.getAgent(),
+        config: engine.config,
+        mcpManager: engine.mcpManager,
+        emit: () => {},
+        persist: () => {},
+        runSwarm: async () => "",
+      },
+    );
+    assert.equal(editRes.isError, false);
+    assert.ok(editRes.output.includes("@@"));
+    assert.equal(engine.session.modifiedFiles?.length, 1);
+
+    const todoRes = await executeTool(
+      "todo_write",
+      {
+        todos: [
+          { id: "1", content: "Inspect auth middleware", status: "completed" },
+          { id: "2", content: "Verify IDOR PoC", status: "in_progress" },
+        ],
+      },
+      {
+        session: engine.session,
+        agent: engine.getAgent(),
+        config: engine.config,
+        mcpManager: engine.mcpManager,
+        emit: () => {},
+        persist: () => {},
+        runSwarm: async () => "",
+      },
+    );
+    assert.equal(todoRes.isError, false);
+    assert.equal(engine.session.todos?.length, 2);
+
+    // 5. Diff viewer (unified + split), Todo card, Sidebar & SplitScreen
+    const unified = stripAnsi(renderDiffView(editRes.output, { view: "unified", width: 80 }).join("\n"));
+    assert.ok(unified.includes("← Edit") && unified.includes("[unified]"));
+    const split = stripAnsi(renderDiffView(editRes.output, { view: "split", width: 130 }).join("\n"));
+    assert.ok(split.includes("[split]") && split.includes("│"));
+
+    const todoCard = stripAnsi(renderTodoListCard(engine.session.todos!).join("\n"));
+    assert.ok(todoCard.includes("# Todos") && todoCard.includes("1/2 done") && todoCard.includes("✓") && todoCard.includes("◐"));
+
+    const sidebar = renderSidebarPanel(engine.session, engine.getAgent(), engine.getProviders(), "http://127.0.0.1:4747", []);
+    const plainSidebar = stripAnsi(sidebar.join("\n"));
+    assert.ok(plainSidebar.includes("Context") && plainSidebar.includes("Modified Files") && plainSidebar.includes("Todos"));
+
+    const splitPane = stripAnsi(renderSplitScreen(["Main line 1", "Main line 2"], sidebar, 130, 42));
+    assert.ok(splitPane.includes("Main line 1") && splitPane.includes("│"));
+
+    // 6. Official Yedogu pixel emblem + full-screen OpenCode prompt box & floating modal compositor
+    const emblem = renderYedoguEmblem();
+    assert.equal(emblem.length, 4);
+    assert.ok(stripAnsi(emblem.join("")).includes("█"));
+
+    const promptBox = renderOpenCodePromptBox({
+      width: 72,
+      input: "",
+      cursorPos: 0,
+      placeholder: 'Ask anything... "Audit /api/auth for IDOR"',
+      agentId: "commander",
+      modelDisplay: "Gemini 4 Neon",
+      providerDisplay: "Google",
+    });
+    assert.equal(promptBox.lines.length, 5);
+    assert.ok(stripAnsi(promptBox.lines.join("\n")).includes("Commander") && stripAnsi(promptBox.lines.join("\n")).includes("Gemini 4 Neon"));
+
+    const modal = renderOpenCodeModal({
+      title: "Connect an integration",
+      width: 56,
+      options: [
+        { value: "anthropic", label: "Anthropic", badge: "API key", checked: true, category: "Popular" },
+        { value: "openai", label: "OpenAI", category: "Popular" },
+        { value: "openrouter", label: "OpenRouter", category: "Services" },
+      ],
+      selectedIndex: 0,
+    });
+    const plainModal = stripAnsi(modal.lines.join("\n"));
+    assert.ok(plainModal.includes("Connect an integration") && plainModal.includes("Popular") && plainModal.includes("✓"));
+
+    const base = new Array(20).fill(" ".repeat(80));
+    const composited = compositeOverlay(base, modal.lines, 3, 12, 56, 80);
+    assert.equal(composited.length, 20);
+    assert.ok(stripAnsi(composited.join("\n")).includes("Connect an integration"));
+
+    // 7. SGR mouse wheel parsing, vertical scrollbar, and /effort slash command
+    assert.equal(parseSgrMouseWheel("\x1b[<64;20;10M"), "up");
+    assert.equal(parseSgrMouseWheel("\x1b[<65;20;10M"), "down");
+    assert.equal(parseSgrMouseWheel("hello"), null);
+
+    const stripped = extractAndStripMouseSequences("\x1b[<64;64;14M\x1b[<0;44;26M\x1b[<32;44;18M\x1b[<0;44;18mabc");
+    assert.deepEqual(stripped.wheels, ["up"]);
+    assert.equal(stripped.cleaned, "abc");
+    assert.deepEqual(
+      stripped.events.map((e) => e.kind),
+      ["wheel-up", "down", "drag", "up"],
+    );
+
+    const sb = renderScrollbarColumn(10, 50, 20);
+    assert.equal(sb.length, 10);
+    assert.ok(sb.some((ch) => stripAnsi(ch) === "┃") && sb.some((ch) => stripAnsi(ch) === "│"));
+    assert.ok(SLASH_COMMAND_SPECS.some((s) => s.name === "/effort"));
+    assert.ok(SLASH_COMMAND_SPECS.some((s) => s.name === "/mouse"));
+  } finally {
+    setActiveTheme(prevTheme);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("takeVisiblePrefix, clipVisible, and compositeOverlay preserve exact alignment when baseRows contain non-SGR CSI escapes", () => {
+  const dirtyRow = `\x1b[2K  \x1b[36m*\x1b[0m Syncing models from connected providers (0.1s)...`;
+  const clipped = clipVisible(dirtyRow, 20);
+  assert.equal(visibleLength(clipped), 20);
+
+  const prefix = takeVisiblePrefix(dirtyRow, 12);
+  assert.equal(visibleLength(prefix), 12);
+
+  const modal = renderOpenCodeModal({
+    title: "Themes",
+    width: 40,
+    maxRows: 4,
+    searchable: false,
+    options: [
+      { value: "yedogu", label: "Yedogu" },
+      { value: "nord", label: "Nord" },
+    ],
+    selectedIndex: 0,
+  });
+
+  const base = new Array(10).fill(" ".repeat(80));
+  base[3] = dirtyRow;
+  const composited = compositeOverlay(base, modal.lines, 2, 12, 40, 80);
+  for (let i = 0; i < modal.lines.length; i++) {
+    const r = 2 + i;
+    const row = composited[r];
+    const titleIdx = stripAnsi(row).indexOf("Themes");
+    if (i === 1) {
+      // Title row starts at leftCol=12 + 2 spaces padding = 14
+      assert.equal(titleIdx, 14);
+    }
+    const linePlain = stripAnsi(row);
+    // Every composited row overlaying base[r] should be at least leftCol + modalWidth wide
+    assert.ok(linePlain.length >= 52, `row ${r} length ${linePlain.length} < 52`);
+    if (r === 3) {
+      // On the dirtyRow line, the overlay must still start at column 12
+      assert.equal(visibleLength(takeVisiblePrefix(row, 12)), 12);
+    }
   }
 });

@@ -32,6 +32,63 @@ export function fsWrite(workspace: string, filePath: string, content: string): s
   return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${abs}`;
 }
 
+export interface FsEditResult {
+  absPath: string;
+  relativePath: string;
+  added: number;
+  removed: number;
+  patch: string;
+}
+
+export function fsEdit(
+  workspace: string,
+  filePath: string,
+  oldText: string,
+  newText: string,
+  replaceAll = false,
+): FsEditResult {
+  const abs = path.isAbsolute(filePath) ? filePath : path.resolve(workspace, filePath);
+  if (!fs.existsSync(abs)) {
+    throw new Error(`File not found: ${abs}`);
+  }
+  const original = fs.readFileSync(abs, "utf8");
+  if (!oldText) {
+    throw new Error("oldText cannot be empty");
+  }
+  const idx = original.indexOf(oldText);
+  if (idx === -1) {
+    throw new Error(`oldText not found in ${abs}`);
+  }
+  const updated = replaceAll
+    ? original.split(oldText).join(newText)
+    : original.slice(0, idx) + newText + original.slice(idx + oldText.length);
+
+  fs.writeFileSync(abs, updated, "utf8");
+
+  const rel = path.relative(workspace, abs) || abs;
+  const oldLines = oldText.split(/\r?\n/);
+  const newLines = newText.split(/\r?\n/);
+  const beforeLines = original.slice(0, idx).split(/\r?\n/);
+  const startLine = Math.max(1, beforeLines.length);
+
+  const hunkHeader = `@@ -${startLine},${oldLines.length} +${startLine},${newLines.length} @@`;
+  const patchLines = [
+    `--- a/${rel}`,
+    `+++ b/${rel}`,
+    hunkHeader,
+    ...oldLines.map((l) => `-${l}`),
+    ...newLines.map((l) => `+${l}`),
+  ];
+
+  return {
+    absPath: abs,
+    relativePath: rel,
+    added: newLines.length,
+    removed: oldLines.length,
+    patch: patchLines.join("\n"),
+  };
+}
+
 export function fsGrep(
   workspace: string,
   pattern: string,

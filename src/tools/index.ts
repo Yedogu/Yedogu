@@ -4,7 +4,7 @@ import { executeHttpForge } from "./httpForge.js";
 import { runJsRecon } from "./jsRecon.js";
 import { runBinaryTriage } from "./binaryTriage.js";
 import { createFinding, exportFindingsReport } from "./findings.js";
-import { fsGlob, fsGrep, fsRead, fsWrite } from "./fsOps.js";
+import { fsEdit, fsGlob, fsGrep, fsRead, fsWrite } from "./fsOps.js";
 import { executeShell } from "./pty.js";
 import type { McpManager } from "./mcpBridge.js";
 import type { GlobalConfig } from "../config/store.js";
@@ -96,6 +96,44 @@ export const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [
         content: { type: "string", description: "Full file contents" },
       },
       required: ["path", "content"],
+    },
+  },
+  {
+    name: "fs_edit",
+    description: "Replace an exact text block in an existing file and record a unified diff patch.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "File path to edit" },
+        oldText: { type: "string", description: "Exact existing text to replace" },
+        newText: { type: "string", description: "Replacement text" },
+        replaceAll: { type: "boolean", description: "Replace all occurrences (default false)" },
+      },
+      required: ["path", "oldText", "newText"],
+    },
+  },
+  {
+    name: "todo_write",
+    description: "Create or update the session # Todos checklist (OpenCode-style live working plan).",
+    parameters: {
+      type: "object",
+      properties: {
+        todos: {
+          type: "array",
+          description: "Full ordered list of todo items",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              content: { type: "string" },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+              priority: { type: "string", enum: ["high", "medium", "low"] },
+            },
+            required: ["id", "content", "status"],
+          },
+        },
+      },
+      required: ["todos"],
     },
   },
   {
@@ -195,9 +233,16 @@ export const BUILTIN_TOOL_SCHEMAS: ToolSchema[] = [
   },
 ];
 
+function resolveToolPermission(agent: AgentDefinition, name: string) {
+  if (agent.permissions[name] !== undefined) return agent.permissions[name];
+  if (name === "fs_edit") return agent.permissions["fs_write"];
+  if (name === "todo_write") return "allow";
+  return undefined;
+}
+
 export function getToolsForAgent(agent: AgentDefinition): ToolSchema[] {
   return BUILTIN_TOOL_SCHEMAS.filter((schema) => {
-    const perm = agent.permissions[schema.name];
+    const perm = resolveToolPermission(agent, schema.name);
     return perm !== "deny" && perm !== undefined;
   });
 }
@@ -207,7 +252,7 @@ export async function executeTool(
   args: Record<string, unknown>,
   ctx: ToolExecutionContext,
 ): Promise<{ output: string; isError: boolean }> {
-  const perm = ctx.agent.permissions[name];
+  const perm = resolveToolPermission(ctx.agent, name);
   if (!perm || perm === "deny") {
     return {
       output: `Permission denied: agent @${ctx.agent.id} is not permitted to invoke tool "${name}".`,
@@ -300,6 +345,45 @@ export async function executeTool(
         const filePath = String(args.path ?? "");
         const content = String(args.content ?? "");
         return { output: fsWrite(ctx.session.workspace, filePath, content), isError: false };
+      }
+
+      case "fs_edit": {
+        const filePath = String(args.path ?? "");
+        const oldText = String(args.oldText ?? "");
+        const newText = String(args.newText ?? "");
+        const replaceAll = Boolean(args.replaceAll);
+        const res = fsEdit(ctx.session.workspace, filePath, oldText, newText, replaceAll);
+        ctx.session.modifiedFiles ??= [];
+        ctx.session.modifiedFiles.unshift({
+          path: res.relativePath,
+          added: res.added,
+          removed: res.removed,
+          patch: res.patch,
+          timestamp: new Date().toISOString(),
+        });
+        if (ctx.session.modifiedFiles.length > 50) ctx.session.modifiedFiles.pop();
+        ctx.persist();
+        ctx.emit("session.updated", { modifiedFiles: ctx.session.modifiedFiles });
+        return { output: res.patch, isError: false };
+      }
+
+      case "todo_write": {
+        const rawTodos = Array.isArray(args.todos) ? args.todos : [];
+        const todos = rawTodos.map((t: any, idx: number) => ({
+          id: String(t?.id || `todo-${idx + 1}`),
+          content: String(t?.content || "").trim(),
+          status: (["pending", "in_progress", "completed"].includes(String(t?.status))
+            ? String(t.status)
+            : "pending") as "pending" | "in_progress" | "completed",
+          priority: ["high", "medium", "low"].includes(String(t?.priority))
+            ? (String(t.priority) as "high" | "medium" | "low")
+            : undefined,
+        })).filter((t) => Boolean(t.content));
+        ctx.session.todos = todos;
+        ctx.persist();
+        ctx.emit("session.updated", { todos });
+        const done = todos.filter((t) => t.status === "completed").length;
+        return { output: `Updated # Todos (${done}/${todos.length} completed)\n` + JSON.stringify(todos), isError: false };
       }
 
       case "fs_grep": {

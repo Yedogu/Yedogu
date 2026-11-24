@@ -1,9 +1,22 @@
+import type {
+  AgentDefinition,
+  ChannelPublicView,
+  ModifiedFileRecord,
+  ProviderConfig,
+  SessionData,
+  TodoItem,
+} from "../types.js";
+import { isProviderConnected } from "../providers/registry.js";
 import {
   PALETTE,
   c,
   clipVisible,
+  formatTokens,
+  getActiveTheme,
   padVisible,
+  renderMiniGauge,
   rule,
+  shortenPath,
   termWidth,
   truncatePlain,
   visibleLength,
@@ -380,4 +393,245 @@ export function renderSectionHeader(title: string, rightMeta?: string, width = t
     `${indent}${left}${" ".repeat(gap)}${rightMeta}`,
     `${indent}${rule(width, undefined, true)}`,
   ];
+}
+
+/**
+ * OpenCode-style Diff Viewer (`Wd`): renders unified or split diff with
+ * line-number gutters and colored added/removed backgrounds.
+ * Automatically uses split mode when `width > 120` unless overridden.
+ */
+export function renderDiffView(
+  patch: string,
+  opts: { filePath?: string; view?: "auto" | "unified" | "split"; width?: number; indent?: string } = {},
+): string[] {
+  const width = opts.width ?? termWidth(116, 56);
+  const indent = opts.indent ?? "  ";
+  const mode = opts.view === "split" || (opts.view !== "unified" && width > 120) ? "split" : "unified";
+  const rawLines = patch.split(/\r?\n/);
+
+  const headerPath = opts.filePath || rawLines.find((l) => l.startsWith("+++ b/"))?.slice(6) || "file";
+  const out: string[] = [
+    `${indent}${c(PALETTE.accent + PALETTE.bold, "← Edit")} ${c(PALETTE.text + PALETTE.bold, headerPath)} ${c(PALETTE.muted, `[${mode}]`)}`,
+  ];
+
+  const bodyLines = rawLines.filter((l) => !l.startsWith("--- ") && !l.startsWith("+++ "));
+  let oldLn = 1;
+  let newLn = 1;
+
+  if (mode === "split") {
+    const colW = Math.max(24, Math.floor((width - 5) / 2));
+    const innerCol = colW - 6;
+    const removedQueue: Array<{ ln: number; text: string }> = [];
+    const addedQueue: Array<{ ln: number; text: string }> = [];
+
+    const flushQueues = () => {
+      const n = Math.max(removedQueue.length, addedQueue.length);
+      for (let i = 0; i < n; i++) {
+        const rem = removedQueue[i];
+        const add = addedQueue[i];
+        const leftCell = rem
+          ? `${PALETTE.diffRemovedBg}${c(PALETTE.muted, String(rem.ln).padStart(4, " "))} ${c(PALETTE.diffRemoved, "-")} ${padVisible(c(PALETTE.text, truncatePlain(rem.text, innerCol)), innerCol)}${PALETTE.reset}`
+          : padVisible("", colW);
+        const rightCell = add
+          ? `${PALETTE.diffAddedBg}${c(PALETTE.muted, String(add.ln).padStart(4, " "))} ${c(PALETTE.diffAdded, "+")} ${padVisible(c(PALETTE.text, truncatePlain(add.text, innerCol)), innerCol)}${PALETTE.reset}`
+          : padVisible("", colW);
+        out.push(`${indent}${leftCell} ${c(PALETTE.border, "│")} ${rightCell}`);
+      }
+      removedQueue.length = 0;
+      addedQueue.length = 0;
+    };
+
+    for (const line of bodyLines.slice(0, 48)) {
+      const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (hunk) {
+        flushQueues();
+        oldLn = Number(hunk[1]);
+        newLn = Number(hunk[2]);
+        out.push(`${indent}${c(PALETTE.diffHunkHeader, truncatePlain(line, width))}`);
+        continue;
+      }
+      if (line.startsWith("-")) {
+        removedQueue.push({ ln: oldLn++, text: line.slice(1) });
+      } else if (line.startsWith("+")) {
+        addedQueue.push({ ln: newLn++, text: line.slice(1) });
+      } else {
+        flushQueues();
+        const txt = line.startsWith(" ") ? line.slice(1) : line;
+        const cell = `${c(PALETTE.muted, String(oldLn).padStart(4, " "))}   ${padVisible(c(PALETTE.secondary, truncatePlain(txt, innerCol)), innerCol)}`;
+        const right = `${c(PALETTE.muted, String(newLn).padStart(4, " "))}   ${padVisible(c(PALETTE.secondary, truncatePlain(txt, innerCol)), innerCol)}`;
+        out.push(`${indent}${cell} ${c(PALETTE.border, "│")} ${right}`);
+        oldLn++;
+        newLn++;
+      }
+    }
+    flushQueues();
+  } else {
+    const innerW = Math.max(20, width - 9);
+    for (const line of bodyLines.slice(0, 48)) {
+      const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (hunk) {
+        oldLn = Number(hunk[1]);
+        newLn = Number(hunk[2]);
+        out.push(`${indent}${c(PALETTE.diffHunkHeader, truncatePlain(line, width))}`);
+        continue;
+      }
+      if (line.startsWith("-")) {
+        const ln = String(oldLn++).padStart(4, " ");
+        out.push(
+          `${indent}${PALETTE.diffRemovedBg}${c(PALETTE.muted, ln)} ${c(PALETTE.diffRemoved, "-")} ${padVisible(c(PALETTE.text, truncatePlain(line.slice(1), innerW)), innerW)}${PALETTE.reset}`,
+        );
+      } else if (line.startsWith("+")) {
+        const ln = String(newLn++).padStart(4, " ");
+        out.push(
+          `${indent}${PALETTE.diffAddedBg}${c(PALETTE.muted, ln)} ${c(PALETTE.diffAdded, "+")} ${padVisible(c(PALETTE.text, truncatePlain(line.slice(1), innerW)), innerW)}${PALETTE.reset}`,
+        );
+      } else {
+        const txt = line.startsWith(" ") ? line.slice(1) : line;
+        const ln = String(newLn).padStart(4, " ");
+        oldLn++;
+        newLn++;
+        out.push(`${indent}${c(PALETTE.muted, ln)}   ${c(PALETTE.secondary, truncatePlain(txt, innerW))}`);
+      }
+    }
+  }
+
+  if (bodyLines.length > 48) {
+    out.push(`${indent}${c(PALETTE.muted, `… ${bodyLines.length - 48} more diff lines`)}`);
+  }
+  return out;
+}
+
+/**
+ * OpenCode `# Todos` card (`Vd`).
+ */
+export function renderTodoListCard(todos: TodoItem[], width = termWidth(76, 48), indent = "  "): string[] {
+  if (!todos || todos.length === 0) {
+    return [`${indent}${c(PALETTE.muted, "# Todos (empty)")}`];
+  }
+  const done = todos.filter((t) => t.status === "completed").length;
+  const lines = todos.map((t) => {
+    if (t.status === "completed") {
+      return `${c(PALETTE.success, "✓")} ${c(PALETTE.muted, truncatePlain(t.content, width - 10))}`;
+    }
+    if (t.status === "in_progress") {
+      return `${c(PALETTE.accent + PALETTE.bold, "◐")} ${c(PALETTE.text + PALETTE.bold, truncatePlain(t.content, width - 10))}`;
+    }
+    return `${c(PALETTE.muted, "○")} ${c(PALETTE.secondary, truncatePlain(t.content, width - 10))}`;
+  });
+  return renderGraphFrame(lines, {
+    title: "# Todos",
+    rightMeta: c(PALETTE.muted, `${done}/${todos.length} done`),
+    frame: "rule",
+    width,
+    indent,
+  }).split("\n");
+}
+
+/**
+ * OpenCode 42-column right Sidebar (`J$ = 42`).
+ */
+export function renderSidebarPanel(
+  session: SessionData,
+  agent: AgentDefinition,
+  providers: ProviderConfig[],
+  daemonUrl: string,
+  channels: ChannelPublicView[] = [],
+  sidebarWidth = 42,
+): string[] {
+  const inner = Math.max(24, sidebarWidth - 2);
+  const totalTok = session.totalInputTokens + session.totalOutputTokens;
+  const connected = providers.filter(isProviderConnected);
+  const theme = getActiveTheme();
+
+  const lines: string[] = [
+    c(PALETTE.text + PALETTE.bold, truncatePlain(session.name || "New session", inner)),
+    `${c(PALETTE.muted, session.id)} ${c(PALETTE.border, "·")} ${c(PALETTE.accent, `@${agent.id}`)}`,
+    rule(inner, undefined, true),
+    c(PALETTE.secondary + PALETTE.bold, "Context"),
+    `  ${renderMiniGauge(totalTok || 1, 200_000, 6)} ${c(PALETTE.muted, `${formatTokens(totalTok)} tok`)}`,
+    `  ${c(PALETTE.muted, "Model:")} ${c(PALETTE.text, truncatePlain(session.agentModels[agent.id] || session.activeModel, inner - 9))}`,
+    `  ${c(PALETTE.muted, "Theme:")} ${c(PALETTE.text, theme.id)}`,
+  ];
+
+  // Todos section
+  const todos = session.todos ?? [];
+  if (todos.length > 0) {
+    const done = todos.filter((t) => t.status === "completed").length;
+    lines.push("");
+    lines.push(`${c(PALETTE.secondary + PALETTE.bold, "Todos")} ${c(PALETTE.muted, `(${done}/${todos.length})`)}`);
+    for (const t of todos.slice(0, 5)) {
+      const icon =
+        t.status === "completed"
+          ? c(PALETTE.success, "✓")
+          : t.status === "in_progress"
+            ? c(PALETTE.accent, "◐")
+            : c(PALETTE.muted, "○");
+      lines.push(`  ${icon} ${c(t.status === "completed" ? PALETTE.muted : PALETTE.text, truncatePlain(t.content, inner - 4))}`);
+    }
+  }
+
+  // Modified files section
+  const modFiles: ModifiedFileRecord[] = session.modifiedFiles ?? [];
+  if (modFiles.length > 0) {
+    lines.push("");
+    lines.push(`${c(PALETTE.secondary + PALETTE.bold, "Modified Files")} ${c(PALETTE.muted, `(${modFiles.length})`)}`);
+    for (const mf of modFiles.slice(0, 5)) {
+      const stats = `${c(PALETTE.diffAdded, `+${mf.added}`)} ${c(PALETTE.diffRemoved, `-${mf.removed}`)}`;
+      const nameMax = Math.max(10, inner - visibleLength(stats) - 4);
+      lines.push(`  ${padVisible(c(PALETTE.text, truncatePlain(mf.path, nameMax)), nameMax)} ${stats}`);
+    }
+  }
+
+  // Findings section
+  lines.push("");
+  lines.push(`${c(PALETTE.secondary + PALETTE.bold, "Findings")} ${c(PALETTE.muted, `(${session.findings.length})`)}`);
+  if (session.findings.length > 0) {
+    const counts = {
+      critical: session.findings.filter((f) => f.severity === "critical").length,
+      high: session.findings.filter((f) => f.severity === "high").length,
+      medium: session.findings.filter((f) => f.severity === "medium").length,
+      low: session.findings.filter((f) => f.severity === "low").length,
+      info: session.findings.filter((f) => f.severity === "info").length,
+    };
+    lines.push(renderSeverityStack(counts, Math.min(18, inner - 14), "  "));
+  } else {
+    lines.push(`  ${c(PALETTE.muted, "No findings yet")}`);
+  }
+
+  // Providers & Channels
+  lines.push("");
+  lines.push(`${c(PALETTE.secondary + PALETTE.bold, "Connections")}`);
+  lines.push(
+    `  ${c(connected.length ? PALETTE.success : PALETTE.warning, "●")} ${c(PALETTE.text, `${connected.length}`)} ${c(PALETTE.muted, "providers")} ${c(PALETTE.border, "·")} ${c(PALETTE.info, truncatePlain(daemonUrl.replace(/^https?:\/\//, ""), 16))}`,
+  );
+  if (channels.length > 0) {
+    const live = channels.filter((ch) => ch.status.state === "connected").length;
+    lines.push(`  ${c(live ? PALETTE.success : PALETTE.muted, "●")} ${c(PALETTE.text, `${live}/${channels.length}`)} ${c(PALETTE.muted, "channels live")}`);
+  }
+
+  // Footer
+  lines.push(rule(inner, undefined, true));
+  lines.push(c(PALETTE.muted, shortenPath(session.workspace, inner)));
+
+  return lines.map((l) => padVisible(clipVisible(l, inner), inner));
+}
+
+/**
+ * Joins a main canvas column and a 42-col OpenCode sidebar side-by-side when terminal width > 120.
+ */
+export function renderSplitScreen(
+  mainLines: string[],
+  sidebarLines: string[],
+  totalWidth = process.stdout.columns || 128,
+  sidebarWidth = 42,
+): string {
+  const mainWidth = Math.max(40, totalWidth - sidebarWidth - 3);
+  const rows = Math.max(mainLines.length, sidebarLines.length);
+  const out: string[] = [];
+  for (let i = 0; i < rows; i++) {
+    const left = padVisible(clipVisible(mainLines[i] ?? "", mainWidth), mainWidth);
+    const right = sidebarLines[i] ?? " ".repeat(sidebarWidth - 2);
+    out.push(`${left} ${c(PALETTE.border, "│")} ${right}`);
+  }
+  return out.join("\n");
 }

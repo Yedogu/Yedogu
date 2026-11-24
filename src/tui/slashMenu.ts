@@ -25,6 +25,7 @@ export interface AgentMentionItem {
   title: string;
   model: string;
   active?: boolean;
+  kind?: "agent" | "file";
 }
 
 export const SLASH_COMMAND_SPECS: readonly SlashCommandSpec[] = [
@@ -32,6 +33,8 @@ export const SLASH_COMMAND_SPECS: readonly SlashCommandSpec[] = [
   { name: "/channels", usage: "[add|start|stop|allow]", description: "Connect Telegram, Discord, Slack & Webhook bots (pop-up)", category: "ui", takesArgs: true, interactivePopup: true },
   { name: "/agent", usage: "[id]", description: "Switch specialist security agent (pop-up)", category: "agent", takesArgs: true, interactivePopup: true },
   { name: "/model", usage: "[p/m] [--agent id]", description: "Switch model or pin per agent (pop-up)", category: "model", takesArgs: true, interactivePopup: true },
+  { name: "/effort", usage: "[none|low|medium|high|xhigh]", description: "Set model reasoning / thinking effort (pop-up)", category: "model", takesArgs: true, interactivePopup: true },
+  { name: "/reasoning", usage: "[none|low|medium|high|xhigh]", description: "Select reasoning effort level (pop-up)", category: "model", takesArgs: true, interactivePopup: true },
   { name: "/theme", usage: "[name]", description: "Live terminal & War-Room color theme (pop-up)", category: "ui", takesArgs: true, interactivePopup: true },
   { name: "/providers", description: "Manage & connect LLM providers (pop-up)", category: "model", interactivePopup: true },
   { name: "/login", usage: "[gemini|codex|claude]", description: "Sign in via Google/Codex/Claude CLI or API key (pop-up)", category: "model", takesArgs: true, interactivePopup: true },
@@ -46,6 +49,20 @@ export const SLASH_COMMAND_SPECS: readonly SlashCommandSpec[] = [
   { name: "/report", usage: "[format] [file]", description: "Export sanitized report (pop-up)", category: "security", takesArgs: true, interactivePopup: true },
   { name: "/mcp", usage: "[list|connect|add]", description: "Manage REA & external MCP servers", category: "security", takesArgs: true },
   { name: "/sessions", description: "Switch or create sessions (pop-up)", category: "session", interactivePopup: true },
+  { name: "/sidebar", usage: "[auto|show|hide]", description: "Toggle OpenCode 42-col right sidebar panel", category: "ui", takesArgs: true },
+  { name: "/timeline", description: "Jump, revert, or fork from any message (pop-up)", category: "session", interactivePopup: true },
+  { name: "/undo", description: "Undo last message turn", category: "session" },
+  { name: "/redo", description: "Redo previously undone message turn", category: "session" },
+  { name: "/yank", description: "Copy last assistant response to clipboard", category: "session" },
+  { name: "/export", usage: "[file]", description: "Export session transcript to Markdown", category: "session", takesArgs: true },
+  { name: "/editor", description: "Compose prompt in external $EDITOR", category: "ui" },
+  { name: "/diff", usage: "[split|unified]", description: "View modified files & toggle split/unified diff", category: "ui", takesArgs: true },
+  { name: "/todos", description: "Inspect session # Todos checklist", category: "session" },
+  { name: "/stash", usage: "[pop|clear]", description: "Stash or pop draft prompts (pop-up)", category: "session", takesArgs: true, interactivePopup: true },
+  { name: "/settings", description: "Configure TUI layout, diff view & verbosity (pop-up)", category: "ui", interactivePopup: true },
+  { name: "/mouse", description: "Toggle mouse capture on/off (for native text selection)", category: "ui" },
+  { name: "/rename", usage: "[name]", description: "Rename current session", category: "session", takesArgs: true },
+  { name: "/fork", usage: "[name]", description: "Fork current session into a new branch", category: "session", takesArgs: true },
   { name: "/new", usage: "[name]", description: "Start a new session", category: "session", takesArgs: true },
   { name: "/compact", description: "Compact conversation context", category: "session" },
   { name: "/clear", description: "Clear messages & redraw header", category: "session" },

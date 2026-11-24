@@ -267,10 +267,26 @@ export interface ProjectConfig {
   updatedAt: string;
 }
 
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed";
+  priority?: "high" | "medium" | "low";
+}
+
+export interface ModifiedFileRecord {
+  path: string;
+  added: number;
+  removed: number;
+  patch: string;
+  timestamp: string;
+}
+
 export interface SessionData {
   id: string;
   name: string;
   projectId?: string;
+  parentSessionId?: string;
   pinned?: boolean;
   workspace: string;
   activeAgent: string;
@@ -283,6 +299,9 @@ export interface SessionData {
   httpHistory: HttpCapture[];
   artifacts: BinaryArtifactSummary[];
   swarmWorkers: SwarmWorkerState[];
+  todos?: TodoItem[];
+  modifiedFiles?: ModifiedFileRecord[];
+  stashedPrompts?: string[];
   totalInputTokens: number;
   totalOutputTokens: number;
   createdAt: string;

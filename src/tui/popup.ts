@@ -20,6 +20,8 @@ export interface SelectOption<T = string> {
   /** When true, `badge` already carries its own ANSI styling (e.g. theme color swatches). */
   badgeRaw?: boolean;
   active?: boolean;
+  checked?: boolean;
+  category?: string;
   keywords?: string;
 }
 

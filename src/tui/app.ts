@@ -1,41 +1,65 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { PassThrough } from "node:stream";
 import type { YedoguEngine } from "../agents/orchestrator.js";
 import type { YedoguDaemon } from "../server/daemon.js";
 import { openInBrowser } from "../server/openBrowser.js";
 import { listSessions } from "../config/store.js";
+import { executeShell } from "../tools/pty.js";
+import { fsGlob } from "../tools/fsOps.js";
 import { formatFriendlyError } from "../providers/errors.js";
 import {
+  formatModelDisplayName,
   groupModelsForPicker,
   isProviderConnected,
   probeAgyModels,
   type GroupedModelEntry,
 } from "../providers/registry.js";
-import type { ChannelPublicView, ChatMessage, HarnessEvent, ProviderConfig } from "../types.js";
+import type { ChannelPublicView, ChatMessage, HarnessEvent, ProviderConfig, ProviderProtocol, ReasoningEffort } from "../types.js";
 import {
   PALETTE,
   SYNC_END,
   SYNC_START,
   c,
+  clipVisible,
   formatTokens,
   getActiveTheme,
   listThemes,
+  osc52Copy,
   padVisible,
   renderThemeSwatch,
+  renderYedoguLogo,
   rule,
   setActiveTheme,
   shortenPath,
+  stripAnsi,
   termWidth,
   truncatePlain,
   visibleLength,
 } from "./theme.js";
+import { LeaderKeyController, type KeybindActionId } from "./keybinds.js";
+import {
+  TerminalScreen,
+  compositeOverlay,
+  extractAndStripMouseSequences,
+  paintSurfaceLine,
+  renderOpenCodeModal,
+  renderOpenCodePromptBox,
+  renderScrollbarColumn,
+  takeVisiblePrefix,
+  takeVisibleSuffix,
+  type OpenCodeModalOption,
+  type SgrMouseEvent,
+} from "./screen.js";
 import { StreamMarkdownWriter } from "./markdown.js";
 import { TerminalSpinner } from "./spinner.js";
 import {
   SLASH_COMMANDS,
   SlashMenuController,
+  filterAgentMentions,
   filterSlashCommands,
   formatSlashCompletion,
 } from "./slashMenu.js";
@@ -44,6 +68,7 @@ import {
   FormModal,
   InputModal,
   SelectModal,
+  filterSelectOptions,
   type ActiveModal,
   type ConfirmModalConfig,
   type ConfirmOutcome,
@@ -55,6 +80,11 @@ import {
   type SelectModalConfig,
   type SelectOption,
 } from "./popup.js";
+import {
+  renderDiffView,
+  renderTodoListCard,
+  renderSidebarPanel,
+} from "./components.js";
 import {
   formatToolArgsCompact,
   renderAgentsTable,
@@ -104,7 +134,7 @@ function suggestCommand(input: string): string | null {
   return best;
 }
 
-const PLACEHOLDER_TEXT = "Ask anything, / commands, @ agent, ^K palette…";
+const PLACEHOLDER_TEXT = "Ask anything, / commands, @ file/agent, ! shell, ^P/^K palette…";
 
 export class YedoguTui {
   private rl: readline.Interface | null = null;
@@ -120,24 +150,595 @@ export class YedoguTui {
   private placeholderVisible = false;
   private remoteTurnActive = false;
   private activeModal: ActiveModal | null = null;
+  private sidebarMode: "auto" | "show" | "hide" = "auto";
+  private diffViewMode: "auto" | "unified" | "split" = "auto";
+  private undoStack: ChatMessage[][] = [];
+  private redoStack: ChatMessage[][] = [];
+  private recentModels: string[] = [];
+  private cachedWorkspaceFiles: string[] = [];
+  private lastFileScanAt = 0;
+  private readonly screen = new TerminalScreen();
+  private fullScreenActive = false;
+  private screenMode: "home" | "session" = "home";
+  private inputBuffer = "";
+  private inputCursor = 0;
+  private inputHistory: string[] = [];
+  private historyIndex = -1;
+  private historyDraft = "";
+  private scrollOffset = 0;
+  private transcriptLines: string[] = [""];
+  private spinnerLabel = "";
+  private spinnerDetail = "";
+  private spinnerFrame = 0;
+  private spinnerTimer: ReturnType<typeof setInterval> | null = null;
+  private popoverIndex = 0;
+  private popoverDismissedFor: string | null = null;
+  private focusArea: "prompt" | "chat" = "prompt";
+  private chatScrollbarGeo: { col: number; topRow: number; height: number; totalLines: number } | null = null;
+  private modalScrollbarGeo: { col: number; topRow: number; height: number; totalItems: number; onScrub: (idx: number) => void } | null = null;
+  private draggingScrollbar: "chat" | "modal" | null = null;
+  private mouseEnabled = true;
+  private textSelection: {
+    startRow: number;
+    startCol: number;
+    endRow: number;
+    endCol: number;
+    dragging: boolean;
+  } | null = null;
+  private lastRenderedRows: string[] = [];
+  private statusToast: string | null = null;
+  private statusToastTimer: ReturnType<typeof setTimeout> | null = null;
+  private overlayRender: (() => {
+    lines: string[];
+    width: number;
+    cursorRow?: number;
+    cursorCol?: number;
+    scrollbarRowOffset?: number;
+    scrollbarHeight?: number;
+    totalItems?: number;
+    onScrub?: (idx: number) => void;
+  }) | null = null;
+  private overlayKeyHandler: ((str: string, key: readline.Key) => void) | null = null;
+  private keypressListener: ((str: string, key: readline.Key) => void) | null = null;
+  private mouseDataListener: ((buf: Buffer) => void) | null = null;
+  private keyStream: PassThrough | null = null;
+  private resizeListener: (() => void) | null = null;
   private readonly spinner = new TerminalSpinner();
-  private readonly markdown = new StreamMarkdownWriter();
+  private readonly markdown = new StreamMarkdownWriter((chunk) => {
+    if (this.fullScreenActive) this.appendTranscript(chunk);
+    else process.stdout.write(chunk);
+  });
   private readonly slashMenu = new SlashMenuController();
+  private readonly leader = new LeaderKeyController(1500, () => {
+    if (this.fullScreenActive) this.render();
+    else if (this.promptActive && !this.activeModal) this.drawIdleDecorations();
+  });
 
   constructor(
     private readonly engine: YedoguEngine,
     private readonly daemon: YedoguDaemon,
   ) {
-    setActiveTheme(this.engine.config.theme || "claude");
-    this.slashMenu.setAgentsProvider(() =>
-      this.engine.getAgents().map((a) => ({
+    setActiveTheme(this.engine.config.theme || "yedogu");
+    this.recentModels = [this.engine.session.activeModel];
+    this.slashMenu.setAgentsProvider(() => {
+      const agentItems = this.engine.getAgents().map((a) => ({
         id: a.id,
         title: a.title,
         model: this.engine.getEffectiveModelForAgent(a.id),
         active: this.engine.session.activeAgent === a.id,
-      })),
-    );
+        kind: "agent" as const,
+      }));
+      const files = this.getWorkspaceFiles();
+      const fileItems = files.slice(0, 60).map((f) => ({
+        id: f,
+        title: "workspace file",
+        model: "file",
+        kind: "file" as const,
+      }));
+      return [...agentItems, ...fileItems];
+    });
+    this.loadCommandHistory();
     this.bindEngineEvents();
+  }
+
+  private getHistoryFilePath(): string {
+    return path.join(os.homedir(), ".yedogu", "history.json");
+  }
+
+  private loadCommandHistory(): void {
+    try {
+      const file = this.getHistoryFilePath();
+      if (fs.existsSync(file)) {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (Array.isArray(parsed)) {
+          this.inputHistory = parsed.filter((x): x is string => typeof x === "string" && x.trim().length > 0).slice(0, 200);
+        }
+      }
+    } catch {
+      // Ignore corrupt history file
+    }
+    if (this.inputHistory.length === 0 && this.engine.session.messages.length > 0) {
+      const userMsgs = this.engine.session.messages
+        .filter((m) => m.role === "user" && m.content.trim().length > 0)
+        .map((m) => m.content.trim())
+        .reverse();
+      for (const msg of userMsgs) {
+        if (this.inputHistory[this.inputHistory.length - 1] !== msg) {
+          this.inputHistory.push(msg);
+        }
+        if (this.inputHistory.length >= 200) break;
+      }
+    }
+  }
+
+  private saveCommandHistory(): void {
+    try {
+      const file = this.getHistoryFilePath();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(this.inputHistory.slice(0, 200)), "utf8");
+    } catch {
+      // Best-effort persistence
+    }
+  }
+
+  private getWorkspaceFiles(): string[] {
+    const now = Date.now();
+    if (now - this.lastFileScanAt > 15000 || this.cachedWorkspaceFiles.length === 0) {
+      try {
+        const raw = fsGlob(this.engine.session.workspace, "", 80);
+        this.cachedWorkspaceFiles = raw.startsWith("No files") ? [] : raw.split(/\r?\n/);
+      } catch {
+        this.cachedWorkspaceFiles = [];
+      }
+      this.lastFileScanAt = now;
+    }
+    return this.cachedWorkspaceFiles;
+  }
+
+  private appendTranscript(chunk: string): void {
+    // Strip non-SGR CSI control sequences (e.g. \x1b[2K, \x1b[1A) so they never pollute frame rows
+    const noCtrl = chunk.replace(/\x1b\[[0-9;?]*[A-LN-Za-ln-z]/g, "");
+    const parts = noCtrl.split("\n");
+    if (this.transcriptLines.length === 0) this.transcriptLines.push("");
+    for (let i = 0; i < parts.length; i++) {
+      const seg = parts[i] ?? "";
+      if (seg.includes("\r")) {
+        const crParts = seg.split("\r");
+        const last = crParts[crParts.length - 1] ?? "";
+        if (i === 0) {
+          this.transcriptLines[this.transcriptLines.length - 1] = last;
+        } else {
+          this.transcriptLines.push(last);
+        }
+      } else {
+        if (i === 0) {
+          this.transcriptLines[this.transcriptLines.length - 1] += seg;
+        } else {
+          this.transcriptLines.push(seg);
+        }
+      }
+    }
+    if (this.transcriptLines.length > 2000) {
+      this.transcriptLines = this.transcriptLines.slice(-2000);
+    }
+    this.scrollOffset = 0;
+  }
+
+  private emitOut(text: string): void {
+    if (this.fullScreenActive) {
+      this.screenMode = "session";
+      this.appendTranscript(text);
+      this.render();
+    } else {
+      process.stdout.write(text);
+    }
+  }
+
+  private startSpinnerFs(label: string, detail = ""): void {
+    if (!this.fullScreenActive) {
+      this.spinner.start(label, detail);
+      return;
+    }
+    this.spinnerLabel = label;
+    this.spinnerDetail = detail;
+    if (!this.spinnerTimer) {
+      this.spinnerTimer = setInterval(() => {
+        this.spinnerFrame = (this.spinnerFrame + 1) % 10;
+        this.render();
+      }, 90);
+    }
+    this.render();
+  }
+
+  private stopSpinnerFs(): void {
+    if (!this.fullScreenActive) {
+      this.spinner.stop(true);
+      return;
+    }
+    this.spinnerLabel = "";
+    this.spinnerDetail = "";
+    if (this.spinnerTimer) {
+      clearInterval(this.spinnerTimer);
+      this.spinnerTimer = null;
+    }
+  }
+
+  private getPopoverState(): {
+    mode: "slash" | "mention";
+    items: Array<{ label: string; description: string; badge?: string; insert: string; isSlash: boolean; takesArgs?: boolean; interactivePopup?: boolean }>;
+  } | null {
+    if (!this.fullScreenActive || this.overlayRender || this.historyIndex !== -1) return null;
+    if (this.popoverDismissedFor !== null && this.popoverDismissedFor === this.inputBuffer) {
+      return null;
+    }
+    this.popoverDismissedFor = null;
+
+    if (this.inputBuffer.startsWith("/") && !/\s/.test(this.inputBuffer)) {
+      const matches = filterSlashCommands(this.inputBuffer) ?? [];
+      return {
+        mode: "slash",
+        items: matches.map((s) => ({
+          label: s.name,
+          description: s.description,
+          badge: s.interactivePopup ? "⊞" : s.category,
+          insert: formatSlashCompletion(s),
+          isSlash: true,
+          takesArgs: s.takesArgs,
+          interactivePopup: s.interactivePopup,
+        })),
+      };
+    }
+
+    if (this.inputBuffer.startsWith("@") && !/\s/.test(this.inputBuffer)) {
+      const agents = this.engine.getAgents().map((a) => ({
+        id: a.id,
+        title: a.title,
+        model: this.engine.getEffectiveModelForAgent(a.id),
+        active: this.engine.session.activeAgent === a.id,
+        kind: "agent" as const,
+      }));
+      const files = this.getWorkspaceFiles().slice(0, 60).map((f) => ({
+        id: f,
+        title: "file",
+        model: "file",
+        kind: "file" as const,
+      }));
+      const matches = filterAgentMentions(this.inputBuffer, [...agents, ...files]) ?? [];
+      return {
+        mode: "mention",
+        items: matches.map((m) => ({
+          label: `@${m.id}`,
+          description: m.kind === "file" ? "workspace file" : m.title,
+          badge: m.kind === "file" ? "file" : truncatePlain(m.model, 20),
+          insert: `@${m.id} `,
+          isSlash: false,
+        })),
+      };
+    }
+    return null;
+  }
+
+  public render(): void {
+    if (!this.fullScreenActive) return;
+    const { cols, rows } = this.screen.size;
+    const baseRows = new Array<string>(rows).fill("");
+    const activeAgent = this.engine.getAgent();
+    const effectiveModel = this.engine.getEffectiveModelForAgent(activeAgent.id);
+    const [provId, ...modelRest] = effectiveModel.split("/");
+    const modelId = modelRest.join("/") || effectiveModel;
+    const provObj = this.engine.getProviders().find((p) => p.id === provId);
+    const provModel = provObj?.models.find((m) => m.id === modelId);
+    const modelDisplay = formatModelDisplayName(effectiveModel, provModel?.name);
+    const providerDisplay = provObj?.name || provId || "Provider";
+    const shellMode = this.inputBuffer.startsWith("!");
+
+    const popover = this.getPopoverState();
+    let cursor: { row: number; col: number } | undefined;
+    this.chatScrollbarGeo = null;
+    this.modalScrollbarGeo = null;
+
+    if (this.screenMode === "home") {
+      const promptW = Math.min(75, Math.max(38, cols - 4));
+      const promptLeft = Math.max(0, Math.floor((cols - promptW) / 2));
+      const logoLines = renderYedoguLogo(cols, true).split("\n");
+      const box = renderOpenCodePromptBox({
+        width: promptW,
+        input: this.inputBuffer,
+        cursorPos: this.inputCursor,
+        placeholder: 'Ask anything... "Audit /api/auth for IDOR"',
+        agentId: activeAgent.id,
+        agentTitle: activeAgent.title,
+        modelDisplay,
+        providerDisplay,
+        effort: this.engine.session.reasoningEffort,
+        shellMode,
+      });
+
+      const totalBlockH = logoLines.length + 2 + box.lines.length + 1;
+      const startY = Math.max(1, Math.floor((rows - 2 - totalBlockH) / 2));
+
+      for (let i = 0; i < logoLines.length; i++) {
+        if (startY + i < rows - 1) baseRows[startY + i] = logoLines[i];
+      }
+
+      const promptTop = startY + logoLines.length + 2;
+      for (let i = 0; i < box.lines.length; i++) {
+        if (promptTop + i < rows - 1) {
+          baseRows[promptTop + i] = `${" ".repeat(promptLeft)}${box.lines[i]}`;
+        }
+      }
+
+      const subRow = promptTop + box.lines.length;
+      if (subRow < rows - 1) {
+        if (this.leader.isArmed) {
+          baseRows[subRow] = `${" ".repeat(promptLeft)}${this.leader.renderHintBar().trimStart()}`;
+        } else {
+          const leftHint = c(PALETTE.muted, shortenPath(this.engine.session.workspace, Math.max(12, promptW - 34)));
+          const rightHint = `${c(PALETTE.text, "shift+tab")} ${c(PALETTE.muted, "agents")}  ${c(PALETTE.text, "ctrl+p")} ${c(PALETTE.muted, "commands")}`;
+          const gap = Math.max(2, promptW - visibleLength(leftHint) - visibleLength(rightHint));
+          baseRows[subRow] = `${" ".repeat(promptLeft)}${leftHint}${" ".repeat(gap)}${rightHint}`;
+        }
+      }
+
+      // Bottom status bar (exact OpenCode Home footer)
+      const connectedCount = this.engine.getConnectedProviders().length;
+      const liveBots = this.engine.channels.getPublicViews().filter((ch) => ch.status.state === "connected").length;
+      const statusLeft =
+        `  ${c(connectedCount > 0 ? PALETTE.success : PALETTE.warning, "⊙")} ` +
+        `${c(PALETTE.text, `${connectedCount} provider${connectedCount === 1 ? "" : "s"}`)} ` +
+        `${c(PALETTE.muted, "/connect")}` +
+        (liveBots > 0 ? `  ${c(PALETTE.info, `· ${liveBots} bot${liveBots === 1 ? "" : "s"}`)}` : "") +
+        `  ${c(PALETTE.muted, "· /browser")}`;
+      const versionRight = c(PALETTE.muted, "1.0.0  ");
+      const botGap = Math.max(2, cols - visibleLength(statusLeft) - visibleLength(versionRight));
+      baseRows[rows - 1] = `${statusLeft}${" ".repeat(botGap)}${versionRight}`;
+
+      if (!this.overlayRender) {
+        cursor = { row: promptTop + box.cursorRowOffset, col: promptLeft + box.cursorColOffset };
+      }
+
+      if (popover && popover.items.length > 0) {
+        const popIdx = Math.max(0, Math.min(this.popoverIndex, popover.items.length - 1));
+        const popModal = renderOpenCodeModal({
+          title: popover.mode === "mention" ? "Route to Agent or File" : "Commands",
+          width: promptW,
+          maxRows: Math.max(4, Math.min(8, rows - subRow - 3)),
+          searchable: false,
+          options: popover.items.map((it) => ({
+            value: it.insert,
+            label: it.label,
+            description: it.description,
+            badge: it.badge,
+          })),
+          selectedIndex: popIdx,
+        });
+        const spliced = compositeOverlay(baseRows, popModal.lines, subRow + 1, promptLeft, promptW, cols);
+        for (let r = 0; r < rows; r++) baseRows[r] = spliced[r];
+      }
+    } else {
+      // Session screen (chat viewport + bottom composer + optional 40-col sidebar)
+      const showSidebar =
+        this.sidebarMode === "show" ||
+        (this.sidebarMode === "auto" && cols > 120 && !this.engine.session.parentSessionId);
+      const sidebarW = 40;
+      const mainCols = showSidebar ? Math.max(48, cols - sidebarW - 1) : cols;
+      const promptW = Math.max(36, mainCols - 4);
+      const promptLeft = 2;
+
+      const box = renderOpenCodePromptBox({
+        width: promptW,
+        input: this.inputBuffer,
+        cursorPos: this.inputCursor,
+        placeholder: 'Ask anything... "/help" or "!" for shell',
+        agentId: activeAgent.id,
+        agentTitle: activeAgent.title,
+        modelDisplay,
+        providerDisplay,
+        effort: this.engine.session.reasoningEffort,
+        shellMode,
+      });
+
+      const chatHeight = Math.max(4, rows - box.lines.length - 2);
+      const allLines = [...this.transcriptLines];
+      if (this.spinnerLabel) {
+        const glyphs = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        const g = glyphs[this.spinnerFrame % glyphs.length];
+        allLines.push(
+          `  ${c(PALETTE.accent, g)} ${c(PALETTE.text, this.spinnerLabel)}${this.spinnerDetail ? ` ${c(PALETTE.muted, this.spinnerDetail)}` : ""}`,
+        );
+      }
+
+      const maxScroll = Math.max(0, allLines.length - chatHeight);
+      const clampedScroll = Math.max(0, Math.min(this.scrollOffset, maxScroll));
+      this.scrollOffset = clampedScroll;
+      const endIdx = allLines.length - clampedScroll;
+      const startIdx = Math.max(0, endIdx - chatHeight);
+      const visibleChat = allLines.slice(startIdx, endIdx);
+      const chatScrollbar = renderScrollbarColumn(chatHeight, allLines.length, startIdx);
+      const chatTextW = Math.max(30, mainCols - 2);
+      this.chatScrollbarGeo = {
+        col: chatTextW + 2, // 1-indexed terminal column of the scrollbar
+        topRow: 1,
+        height: chatHeight,
+        totalLines: allLines.length,
+      };
+
+      const mainRows = new Array<string>(rows).fill("");
+      for (let i = 0; i < chatHeight; i++) {
+        const line = visibleChat[i] ?? "";
+        const padded = padVisible(clipVisible(line, chatTextW), chatTextW);
+        mainRows[i] = `${padded} ${chatScrollbar[i] ?? "│"}`;
+      }
+
+      const promptTop = chatHeight;
+      for (let i = 0; i < box.lines.length; i++) {
+        if (promptTop + i < rows - 1) {
+          mainRows[promptTop + i] = `${" ".repeat(promptLeft)}${box.lines[i]}`;
+        }
+      }
+
+      const subRow = promptTop + box.lines.length;
+      if (subRow < rows) {
+        if (this.leader.isArmed) {
+          mainRows[subRow] = `${" ".repeat(promptLeft)}${this.leader.renderHintBar().trimStart()}`;
+        } else {
+          const focusHint = this.statusToast
+            ? c(PALETTE.success, this.statusToast)
+            : this.focusArea === "chat"
+              ? `${c(PALETTE.accent, "chat scroll")} ${c(PALETTE.muted, "(↑↓ scroll · type/esc prompt)")}`
+              : `${c(PALETTE.muted, shortenPath(this.engine.session.workspace, 28))}  ${c(PALETTE.muted, `${this.engine.session.id}`)}`;
+          const rightInfo = `${c(PALETTE.text, "ctrl+p")} ${c(PALETTE.muted, "palette")}  ${c(PALETTE.text, "ctrl+x")} ${c(PALETTE.muted, "leader")}`;
+          const gap = Math.max(2, promptW - visibleLength(focusHint) - visibleLength(rightInfo));
+          mainRows[subRow] = `${" ".repeat(promptLeft)}${focusHint}${" ".repeat(gap)}${rightInfo}`;
+        }
+      }
+
+      if (showSidebar) {
+        const sideLines = renderSidebarPanel(
+          this.engine.session,
+          activeAgent,
+          this.engine.getProviders(),
+          this.daemon.url,
+          this.engine.channels.getPublicViews(),
+          sidebarW,
+        );
+        for (let r = 0; r < rows; r++) {
+          const left = padVisible(clipVisible(mainRows[r] ?? "", mainCols), mainCols);
+          const right = paintSurfaceLine(` ${sideLines[r] ?? ""}`, sidebarW, PALETTE.pillBg);
+          baseRows[r] = `${left} ${right}`;
+        }
+      } else {
+        for (let r = 0; r < rows; r++) baseRows[r] = mainRows[r];
+      }
+
+      if (!this.overlayRender) {
+        cursor = { row: promptTop + box.cursorRowOffset, col: promptLeft + box.cursorColOffset };
+      }
+
+      if (popover && popover.items.length > 0) {
+        const popIdx = Math.max(0, Math.min(this.popoverIndex, popover.items.length - 1));
+        const popModal = renderOpenCodeModal({
+          title: popover.mode === "mention" ? "Route to Agent or File" : "Commands",
+          width: Math.min(promptW, 72),
+          maxRows: Math.max(4, Math.min(8, promptTop - 2)),
+          searchable: false,
+          options: popover.items.map((it) => ({
+            value: it.insert,
+            label: it.label,
+            description: it.description,
+            badge: it.badge,
+          })),
+          selectedIndex: popIdx,
+        });
+        const popTop = Math.max(1, promptTop - popModal.lines.length);
+        const spliced = compositeOverlay(baseRows, popModal.lines, popTop, promptLeft, Math.min(promptW, 72), cols);
+        for (let r = 0; r < rows; r++) baseRows[r] = spliced[r];
+      }
+    }
+
+    // Floating elevated OpenCode modal overlay
+    let finalRows = baseRows;
+    if (this.overlayRender) {
+      const ov = this.overlayRender();
+      const topRow = Math.max(1, Math.floor((rows - ov.lines.length) / 2));
+      const leftCol = Math.max(1, Math.floor((cols - ov.width) / 2));
+      finalRows = compositeOverlay(baseRows, ov.lines, topRow, leftCol, ov.width, cols);
+      if (ov.cursorRow !== undefined && ov.cursorCol !== undefined) {
+        cursor = { row: topRow + ov.cursorRow, col: leftCol + ov.cursorCol };
+      } else {
+        cursor = undefined;
+      }
+      if (ov.scrollbarRowOffset !== undefined && ov.scrollbarHeight && ov.totalItems && ov.onScrub) {
+        this.modalScrollbarGeo = {
+          col: leftCol + ov.width - 1, // 1-indexed column of modal scrollbar
+          topRow: topRow + ov.scrollbarRowOffset + 1,
+          height: ov.scrollbarHeight,
+          totalItems: ov.totalItems,
+          onScrub: ov.onScrub,
+        };
+      }
+    }
+
+    this.lastRenderedRows = [...finalRows];
+    const displayRows = this.textSelection
+      ? this.applySelectionHighlight(finalRows, this.textSelection, cols)
+      : finalRows;
+    this.screen.paint(displayRows, cursor);
+  }
+
+  private showStatusToast(msg: string, durationMs = 2500): void {
+    this.statusToast = msg;
+    if (this.statusToastTimer) clearTimeout(this.statusToastTimer);
+    this.statusToastTimer = setTimeout(() => {
+      this.statusToast = null;
+      this.statusToastTimer = null;
+      if (this.fullScreenActive) this.render();
+    }, durationMs);
+    if (this.fullScreenActive) this.render();
+  }
+
+  private toggleMouseCapture(): void {
+    this.mouseEnabled = !this.mouseEnabled;
+    this.screen.setMouseEnabled(this.mouseEnabled);
+    this.showStatusToast(
+      this.mouseEnabled
+        ? "Mouse capture ON (scroll & drag-select)"
+        : "Mouse capture OFF (native select · Alt+M or /mouse to restore)",
+      3500,
+    );
+  }
+
+  private normalizeSelection(sel: {
+    startRow: number;
+    startCol: number;
+    endRow: number;
+    endCol: number;
+  }): { r1: number; c1: number; r2: number; c2: number } {
+    if (sel.startRow < sel.endRow || (sel.startRow === sel.endRow && sel.startCol <= sel.endCol)) {
+      return { r1: sel.startRow, c1: sel.startCol, r2: sel.endRow, c2: sel.endCol };
+    }
+    return { r1: sel.endRow, c1: sel.endCol, r2: sel.startRow, c2: sel.startCol };
+  }
+
+  private applySelectionHighlight(
+    rows: string[],
+    sel: { startRow: number; startCol: number; endRow: number; endCol: number },
+    cols: number,
+  ): string[] {
+    const { r1, c1, r2, c2 } = this.normalizeSelection(sel);
+    const out = [...rows];
+    for (let r = r1; r <= r2; r++) {
+      if (r < 0 || r >= out.length) continue;
+      const row = out[r] ?? "";
+      const rowStart = r === r1 ? Math.max(0, c1) : 0;
+      const rowEnd = r === r2 ? Math.min(cols - 1, c2) : cols - 1;
+      if (rowEnd < rowStart) continue;
+      const left = takeVisiblePrefix(row, rowStart);
+      const midPlain = stripAnsi(takeVisiblePrefix(row, rowEnd + 1)).slice(rowStart);
+      const right = rowEnd + 1 < cols ? takeVisibleSuffix(row, rowEnd + 1) : "";
+      out[r] = `${left}\x1b[7m${midPlain}\x1b[27m${right}`;
+    }
+    return out;
+  }
+
+  private extractSelectedText(
+    rows: string[],
+    sel: { startRow: number; startCol: number; endRow: number; endCol: number },
+  ): string {
+    const { r1, c1, r2, c2 } = this.normalizeSelection(sel);
+    const lines: string[] = [];
+    for (let r = r1; r <= r2; r++) {
+      if (r < 0 || r >= rows.length) continue;
+      const plain = stripAnsi(rows[r] ?? "");
+      const rowStart = r === r1 ? Math.max(0, c1) : 0;
+      const rowEnd = r === r2 ? c2 : plain.length - 1;
+      if (rowEnd < rowStart) {
+        lines.push("");
+        continue;
+      }
+      lines.push(plain.slice(rowStart, rowEnd + 1).replace(/\s+$/, ""));
+    }
+    return lines.join("\n").trimEnd();
   }
 
   private bindEngineEvents(): void {
@@ -151,64 +752,66 @@ export class YedoguTui {
           this.activeAgentLabel = `@${p.agentId}`;
           this.activeModelLabel = p.model;
           this.markdown.reset();
-          process.stdout.write("\n");
-          this.spinner.start("Thinking…", `${this.activeAgentLabel} · ${truncatePlain(p.model, 28)}`);
+          this.emitOut("\n");
+          this.startSpinnerFs("Thinking…", `${this.activeAgentLabel} · ${truncatePlain(p.model, 28)}`);
           break;
         }
         case "reasoning.delta": {
           const p = evt.payload as { delta: string };
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
           if (!this.isStreamingReasoning) {
             this.isStreamingReasoning = true;
-            process.stdout.write(
+            this.emitOut(
               `  ${c(PALETTE.reasoning, "◇")} ${c(PALETTE.muted + PALETTE.italic, "Thinking")}\n  ${c(PALETTE.border, "│")} `,
             );
           }
-          process.stdout.write(
+          this.emitOut(
             c(PALETTE.muted + PALETTE.italic, p.delta.replace(/\n/g, `\n  ${c(PALETTE.border, "│")} `)),
           );
           break;
         }
         case "message.delta": {
           const p = evt.payload as { delta: string };
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
           if (this.isStreamingReasoning && !this.isStreamingText) {
-            process.stdout.write("\n\n");
+            this.emitOut("\n\n");
           }
           if (!this.isStreamingText) {
             this.isStreamingText = true;
-            process.stdout.write(
+            this.emitOut(
               `  ${c(PALETTE.accent, "✦")} ${c(PALETTE.text + PALETTE.bold, this.activeAgentLabel)} ${c(PALETTE.muted, this.activeModelLabel)}\n\n`,
             );
           }
           this.markdown.push(p.delta);
+          if (this.fullScreenActive) this.render();
           break;
         }
         case "message.done": {
           const p = evt.payload as ChatMessage;
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
           if (p.role === "user" && p.source) {
-            if (this.promptActive && !this.activeModal) {
+            if (this.promptActive && !this.activeModal && !this.fullScreenActive) {
               this.promptActive = false;
               this.clearDecorations();
               this.slashMenu.reset();
               process.stdout.write("\r\x1b[2K");
             }
             this.remoteTurnActive = true;
-            process.stdout.write(
+            this.emitOut(
               `\n  ${c(PALETTE.info + PALETTE.bold, "◉")} ${c(PALETTE.accentSoft, `[${p.source.platform} · ${p.source.senderName}]`)} ${c(PALETTE.text, p.content)}\n`,
             );
           } else if (p.role === "assistant") {
             if (this.isStreamingText) {
               this.markdown.flush();
             } else if (this.isStreamingReasoning) {
-              process.stdout.write("\n");
+              this.emitOut("\n");
             }
             this.isStreamingText = false;
             this.isStreamingReasoning = false;
+            if (this.fullScreenActive) this.render();
             if (this.remoteTurnActive && (!p.toolCalls || p.toolCalls.length === 0)) {
               this.remoteTurnActive = false;
-              if (!this.activeModal && !this.promptActive) {
+              if (!this.fullScreenActive && !this.activeModal && !this.promptActive) {
                 this.prompt(true);
               }
             }
@@ -217,39 +820,43 @@ export class YedoguTui {
         }
         case "tool.start": {
           const p = evt.payload as { toolCall: { name: string; arguments: Record<string, unknown> } };
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
           if (this.isStreamingText) {
             this.markdown.flush();
             this.isStreamingText = false;
           }
           this.toolStepCount++;
-          process.stdout.write(renderToolStart(p.toolCall.name, p.toolCall.arguments, this.toolStepCount));
+          this.emitOut(renderToolStart(p.toolCall.name, p.toolCall.arguments, this.toolStepCount));
           const compactArgs = formatToolArgsCompact(p.toolCall.arguments, 40);
-          this.spinner.start(`Running ${p.toolCall.name}…`, compactArgs);
+          this.startSpinnerFs(`Running ${p.toolCall.name}…`, compactArgs);
           break;
         }
         case "tool.done": {
           const p = evt.payload as {
             toolCall: { name: string; status: string; durationMs?: number; output?: string };
           };
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
           const ok = p.toolCall.status !== "error";
-          process.stdout.write(
-            renderToolDone(p.toolCall.name, ok, p.toolCall.durationMs ?? 0, p.toolCall.output),
+          this.emitOut(
+            renderToolDone(p.toolCall.name, ok, p.toolCall.durationMs ?? 0, p.toolCall.output, this.diffViewMode),
           );
           break;
         }
         case "finding.updated": {
           const f = evt.payload as { id: string; severity: string; title: string };
-          this.spinner.stop(true);
-          process.stdout.write(
+          this.stopSpinnerFs();
+          this.emitOut(
             `\n  ${c(PALETTE.danger + PALETTE.bold, "⚑ Finding logged")} ${c(PALETTE.info, f.id)} ${c(PALETTE.warning, `[${f.severity.toUpperCase()}]`)} ${c(PALETTE.text, f.title)}\n`,
           );
           break;
         }
         case "system.notice": {
           const n = evt.payload as { level?: string; message: string };
-          this.spinner.stop(true);
+          this.stopSpinnerFs();
+          if (this.fullScreenActive && n.level !== "error") {
+            this.render();
+            break;
+          }
           const col =
             n.level === "error"
               ? PALETTE.danger
@@ -260,10 +867,10 @@ export class YedoguTui {
             .split(/\r?\n/)
             .map((line, i) => (i === 0 ? `\n  ${c(col, "▸")} ${c(PALETTE.secondary, line)}` : `    ${c(PALETTE.muted, line)}`))
             .join("\n");
-          process.stdout.write(`${formattedLines}\n`);
+          this.emitOut(`${formattedLines}\n`);
           if (this.remoteTurnActive && n.level === "error") {
             this.remoteTurnActive = false;
-            if (!this.activeModal && !this.promptActive) {
+            if (!this.fullScreenActive && !this.activeModal && !this.promptActive) {
               this.prompt(true);
             }
           }
@@ -274,6 +881,41 @@ export class YedoguTui {
   }
 
   public async start(): Promise<void> {
+    if (process.stdout.isTTY && process.stdin.isTTY) {
+      this.fullScreenActive = true;
+      this.screen.enter();
+      this.keyStream = new PassThrough();
+      readline.emitKeypressEvents(this.keyStream);
+      if (typeof process.stdin.setRawMode === "function") {
+        process.stdin.setRawMode(true);
+      }
+      process.stdin.resume();
+
+      this.keypressListener = (str: string, key: readline.Key = {}) => {
+        this.handleFullScreenKeypress(str || "", key);
+      };
+      this.mouseDataListener = (buf: Buffer) => {
+        const { cleaned, events } = extractAndStripMouseSequences(buf.toString("utf8"));
+        for (const ev of events) {
+          this.handleMouseEvent(ev);
+        }
+        if (cleaned.length > 0 && this.keyStream) {
+          this.keyStream.write(cleaned);
+        }
+      };
+      this.resizeListener = () => {
+        this.render();
+      };
+      process.stdin.on("data", this.mouseDataListener);
+      this.keyStream.on("keypress", this.keypressListener);
+      process.stdout.on("resize", this.resizeListener);
+      process.on("SIGINT", () => void this.shutdown());
+      process.on("SIGTERM", () => void this.shutdown());
+
+      this.render();
+      return;
+    }
+
     process.stdout.write(
       renderBanner(
         this.engine.session,
@@ -281,6 +923,7 @@ export class YedoguTui {
         this.engine.getProviders(),
         this.daemon.url,
         this.engine.channels.getPublicViews(),
+        { sidebarMode: this.sidebarMode },
       ),
     );
 
@@ -351,6 +994,472 @@ export class YedoguTui {
     this.prompt(true);
   }
 
+  private handleMouseEvent(ev: SgrMouseEvent): void {
+    if (!this.fullScreenActive) return;
+    if (ev.kind === "wheel-up") {
+      this.handleMouseWheel("up");
+      return;
+    }
+    if (ev.kind === "wheel-down") {
+      this.handleMouseWheel("down");
+      return;
+    }
+    if (ev.kind === "up") {
+      this.draggingScrollbar = null;
+      if (this.textSelection?.dragging) {
+        this.textSelection.dragging = false;
+        const dragged =
+          this.textSelection.startRow !== this.textSelection.endRow ||
+          this.textSelection.startCol !== this.textSelection.endCol;
+        if (dragged) {
+          const text = this.extractSelectedText(this.lastRenderedRows, this.textSelection);
+          this.textSelection = null;
+          if (text.length > 0) {
+            this.copyTextToClipboard(text);
+            this.showStatusToast(`✓ Copied ${text.length} chars`);
+          } else {
+            this.render();
+          }
+        } else {
+          this.textSelection = null;
+          this.render();
+        }
+      }
+      return;
+    }
+
+    const scrubModal = (row: number) => {
+      const geo = this.modalScrollbarGeo;
+      if (!geo || geo.totalItems <= 1) return;
+      const ratio = Math.max(0, Math.min(1, (row - geo.topRow) / Math.max(1, geo.height - 1)));
+      const idx = Math.round(ratio * (geo.totalItems - 1));
+      geo.onScrub(idx);
+    };
+
+    const scrubChat = (row: number) => {
+      const geo = this.chatScrollbarGeo;
+      if (!geo) return;
+      const maxScroll = Math.max(0, geo.totalLines - geo.height);
+      const ratio = Math.max(0, Math.min(1, (row - geo.topRow) / Math.max(1, geo.height - 1)));
+      // top of track = maxScroll, bottom of track = 0
+      this.scrollOffset = Math.round((1 - ratio) * maxScroll);
+      this.render();
+    };
+
+    if (ev.kind === "down") {
+      this.textSelection = null;
+      if (this.modalScrollbarGeo) {
+        const g = this.modalScrollbarGeo;
+        if (Math.abs(ev.col - g.col) <= 2 && ev.row >= g.topRow && ev.row < g.topRow + g.height) {
+          this.draggingScrollbar = "modal";
+          scrubModal(ev.row);
+          return;
+        }
+      }
+      if (!this.overlayRender && this.chatScrollbarGeo && this.screenMode === "session") {
+        const g = this.chatScrollbarGeo;
+        if (Math.abs(ev.col - g.col) <= 2 && ev.row >= g.topRow && ev.row < g.topRow + g.height) {
+          this.focusArea = "chat";
+          this.draggingScrollbar = "chat";
+          scrubChat(ev.row);
+          return;
+        }
+        if (ev.row >= g.topRow && ev.row < g.topRow + g.height && ev.col <= g.col) {
+          this.focusArea = "chat";
+        } else {
+          this.focusArea = "prompt";
+        }
+      }
+      const row = Math.max(0, ev.row - 1);
+      const col = Math.max(0, ev.col - 1);
+      this.textSelection = { startRow: row, startCol: col, endRow: row, endCol: col, dragging: true };
+      this.render();
+    } else if (ev.kind === "drag") {
+      if (this.draggingScrollbar === "modal") {
+        scrubModal(ev.row);
+      } else if (this.draggingScrollbar === "chat") {
+        scrubChat(ev.row);
+      } else if (this.textSelection?.dragging) {
+        this.textSelection.endRow = Math.max(0, ev.row - 1);
+        this.textSelection.endCol = Math.max(0, ev.col - 1);
+        this.render();
+      }
+    }
+  }
+
+  private handleMouseWheel(dir: "up" | "down"): void {
+    if (!this.fullScreenActive) return;
+    if (this.overlayKeyHandler) {
+      this.overlayKeyHandler("", { name: dir });
+      return;
+    }
+    const pop = this.getPopoverState();
+    if (pop && pop.items.length > 0) {
+      const delta = dir === "up" ? -1 : 1;
+      this.popoverIndex = (this.popoverIndex + delta + pop.items.length) % pop.items.length;
+      this.render();
+      return;
+    }
+    if (this.screenMode === "session") {
+      if (dir === "up") {
+        this.scrollOffset += 3;
+      } else {
+        this.scrollOffset = Math.max(0, this.scrollOffset - 3);
+      }
+      this.render();
+    }
+  }
+
+  private handleFullScreenKeypress(str: string, key: readline.Key = {}): void {
+    // Ignore raw SGR mouse escape fragments (handled by mouseDataListener)
+    if (str.startsWith("\x1b[<") || /^\[\<\d+;\d+;\d+[Mm]$/.test(str) || key.sequence?.startsWith("\x1b[<")) {
+      return;
+    }
+
+    // 1. Floating overlay modal owns all input while open
+    if (this.overlayKeyHandler) {
+      this.overlayKeyHandler(str, key);
+      return;
+    }
+
+    // 2. Ctrl+C: abort active generation or double-press to exit
+    if (key.ctrl && key.name === "c") {
+      if (this.engine.busy) {
+        this.stopSpinnerFs();
+        this.markdown.flush();
+        this.engine.abortActive();
+        this.emitOut(`\n  ${c(PALETTE.warning, "!")} ${c(PALETTE.muted, "Aborted active generation.")}\n`);
+        return;
+      }
+      if (this.inputBuffer.length > 0) {
+        this.inputBuffer = "";
+        this.inputCursor = 0;
+        this.render();
+        return;
+      }
+      const now = Date.now();
+      if (now - this.lastSigint < 1500) {
+        void this.shutdown();
+        return;
+      }
+      this.lastSigint = now;
+      this.emitOut(`\n  ${c(PALETTE.muted, "Press Ctrl+C again or type /exit to quit.")}\n`);
+      return;
+    }
+
+    if (this.engine.busy) {
+      if (key.name === "escape") {
+        this.stopSpinnerFs();
+        this.markdown.flush();
+        this.engine.abortActive();
+        this.emitOut(`\n  ${c(PALETTE.warning, "!")} ${c(PALETTE.muted, "Interrupted.")}\n`);
+      } else if (key.name === "pageup") {
+        this.scrollOffset += 8;
+        this.render();
+      } else if (key.name === "pagedown") {
+        this.scrollOffset = Math.max(0, this.scrollOffset - 8);
+        this.render();
+      }
+      return;
+    }
+
+    // 3. Leader key (<leader> = Ctrl+X) chord resolution
+    if (this.leader.isArmed) {
+      const action = this.leader.resolveChord(str, key);
+      if (action === "cancel") {
+        this.render();
+        return;
+      }
+      if (action) {
+        void this.dispatchKeybindAction(action).catch((err) => {
+          this.emitOut(`\n  ${c(PALETTE.danger, "✗")} ${c(PALETTE.text, formatFriendlyError(err))}\n`);
+        });
+        return;
+      }
+      this.render();
+    }
+
+    if (key.ctrl && key.name === "x") {
+      this.leader.arm();
+      this.render();
+      return;
+    }
+
+    // 4. Global OpenCode + Yedogu shortcuts
+    const runModalAction = (fn: () => Promise<void>) => {
+      void fn().catch((err) => {
+        this.emitOut(`\n  ${c(PALETTE.danger, "✗")} ${c(PALETTE.text, formatFriendlyError(err))}\n`);
+      });
+    };
+
+    if (key.ctrl && (key.name === "p" || key.name === "k")) {
+      runModalAction(() => this.openCommandPalette());
+      return;
+    }
+    if (key.shift && key.name === "tab") {
+      this.cycleActiveAgent(1);
+      this.render();
+      return;
+    }
+    if (key.name === "f2") {
+      this.cycleRecentModel(key.shift ? -1 : 1);
+      this.render();
+      return;
+    }
+    if (key.ctrl && key.name === "g") {
+      runModalAction(() => this.openAgentPicker());
+      return;
+    }
+    if (key.ctrl && key.name === "t") {
+      runModalAction(() => this.openThemePicker());
+      return;
+    }
+    if (key.ctrl && key.name === "o") {
+      runModalAction(() => this.openSessionPicker());
+      return;
+    }
+    if (key.ctrl && key.name === "b") {
+      runModalAction(async () => { await this.handleSlashCommand("/browser"); });
+      return;
+    }
+    if (key.meta && key.name === "m") {
+      this.toggleMouseCapture();
+      return;
+    }
+    if (key.ctrl && key.name === "r") {
+      runModalAction(() => this.renameCurrentSession());
+      return;
+    }
+    if (key.ctrl && key.name === "l") {
+      this.transcriptLines = [""];
+      this.scrollOffset = 0;
+      this.screenMode = "home";
+      this.render();
+      return;
+    }
+    if (str === "?" && !key.ctrl && !key.meta && this.inputBuffer.length === 0) {
+      runModalAction(async () => { await this.handleSlashCommand("/help"); });
+      return;
+    }
+
+    // 5. Scrollback navigation in Session view
+    if (key.name === "pageup") {
+      this.scrollOffset += 8;
+      this.render();
+      return;
+    }
+    if (key.name === "pagedown") {
+      this.scrollOffset = Math.max(0, this.scrollOffset - 8);
+      this.render();
+      return;
+    }
+
+    // 6. Active `/` or `@` popover navigation
+    const pop = this.getPopoverState();
+    if (pop && pop.items.length > 0) {
+      if (key.name === "up") {
+        this.popoverIndex = (this.popoverIndex - 1 + pop.items.length) % pop.items.length;
+        this.render();
+        return;
+      }
+      if (key.name === "down") {
+        this.popoverIndex = (this.popoverIndex + 1) % pop.items.length;
+        this.render();
+        return;
+      }
+      if (key.name === "escape") {
+        this.popoverDismissedFor = this.inputBuffer;
+        this.render();
+        return;
+      }
+      if (key.name === "tab") {
+        const chosen = pop.items[Math.max(0, Math.min(this.popoverIndex, pop.items.length - 1))];
+        if (chosen) {
+          this.inputBuffer = chosen.insert;
+          this.inputCursor = this.inputBuffer.length;
+          this.popoverDismissedFor = this.inputBuffer;
+          this.render();
+        }
+        return;
+      }
+      if (key.name === "return" || key.name === "enter") {
+        const chosen = pop.items[Math.max(0, Math.min(this.popoverIndex, pop.items.length - 1))];
+        if (chosen) {
+          if (!chosen.isSlash) {
+            this.inputBuffer = chosen.insert;
+            this.inputCursor = this.inputBuffer.length;
+            this.popoverDismissedFor = this.inputBuffer;
+            this.render();
+            return;
+          }
+          if (chosen.takesArgs && !chosen.interactivePopup && this.inputBuffer !== chosen.label) {
+            this.inputBuffer = `${chosen.label} `;
+            this.inputCursor = this.inputBuffer.length;
+            this.render();
+            return;
+          }
+          this.inputBuffer = chosen.label;
+          this.inputCursor = this.inputBuffer.length;
+        }
+      }
+    }
+
+    // 7. Standard prompt editing keys
+    if (key.name === "escape" && this.focusArea === "chat") {
+      this.focusArea = "prompt";
+      this.render();
+      return;
+    }
+    if (key.name === "escape" && this.inputBuffer.length > 0) {
+      this.inputBuffer = "";
+      this.inputCursor = 0;
+      this.render();
+      return;
+    }
+    if (key.name === "return" || key.name === "enter") {
+      const submitted = this.inputBuffer.trim();
+      this.inputBuffer = "";
+      this.inputCursor = 0;
+      this.popoverIndex = 0;
+      this.popoverDismissedFor = null;
+      this.historyIndex = -1;
+      this.historyDraft = "";
+      if (!submitted) {
+        this.render();
+        return;
+      }
+      if (this.inputHistory[0] !== submitted) {
+        this.inputHistory.unshift(submitted);
+        if (this.inputHistory.length > 200) this.inputHistory.pop();
+        this.saveCommandHistory();
+      }
+      this.screenMode = "session";
+      if (!submitted.startsWith("/")) {
+        this.appendTranscript(`\n  ${c(PALETTE.accent, "┃")} ${c(PALETTE.text + PALETTE.bold, submitted)}\n`);
+      }
+      this.render();
+      void this.executeSubmittedLine(submitted).then(() => {
+        this.render();
+      });
+      return;
+    }
+    if (key.name === "backspace") {
+      if (this.inputCursor > 0) {
+        this.historyIndex = -1;
+        this.popoverDismissedFor = null;
+        this.inputBuffer =
+          this.inputBuffer.slice(0, this.inputCursor - 1) +
+          this.inputBuffer.slice(this.inputCursor);
+        this.inputCursor--;
+        this.popoverIndex = 0;
+        this.render();
+      }
+      return;
+    }
+    if (key.name === "delete") {
+      if (this.inputCursor < this.inputBuffer.length) {
+        this.historyIndex = -1;
+        this.popoverDismissedFor = null;
+        this.inputBuffer =
+          this.inputBuffer.slice(0, this.inputCursor) +
+          this.inputBuffer.slice(this.inputCursor + 1);
+        this.render();
+      }
+      return;
+    }
+    if (key.ctrl && key.name === "u") {
+      this.historyIndex = -1;
+      this.popoverDismissedFor = null;
+      this.inputBuffer = "";
+      this.inputCursor = 0;
+      this.render();
+      return;
+    }
+    if (key.ctrl && key.name === "w") {
+      this.historyIndex = -1;
+      this.popoverDismissedFor = null;
+      const before = this.inputBuffer.slice(0, this.inputCursor).replace(/\s+$/, "");
+      const idx = before.lastIndexOf(" ");
+      const nextCursor = idx === -1 ? 0 : idx + 1;
+      this.inputBuffer = this.inputBuffer.slice(0, nextCursor) + this.inputBuffer.slice(this.inputCursor);
+      this.inputCursor = nextCursor;
+      this.render();
+      return;
+    }
+    if (key.name === "left") {
+      if (this.inputCursor > 0) {
+        this.inputCursor--;
+        this.render();
+      }
+      return;
+    }
+    if (key.name === "right") {
+      if (this.inputCursor < this.inputBuffer.length) {
+        this.inputCursor++;
+        this.render();
+      }
+      return;
+    }
+    if (key.name === "home" || (key.ctrl && key.name === "a")) {
+      this.inputCursor = 0;
+      this.render();
+      return;
+    }
+    if (key.name === "end" || (key.ctrl && key.name === "e" && this.inputBuffer.length > 0)) {
+      this.inputCursor = this.inputBuffer.length;
+      this.render();
+      return;
+    }
+    if (key.ctrl && key.name === "e" && this.inputBuffer.length === 0) {
+      runModalAction(() => this.openReasoningPicker());
+      return;
+    }
+    if (key.name === "up") {
+      this.focusArea = "prompt";
+      if (this.inputHistory.length > 0) {
+        if (this.historyIndex === -1) {
+          this.historyDraft = this.inputBuffer;
+        }
+        this.historyIndex = Math.min(this.inputHistory.length - 1, this.historyIndex + 1);
+        this.inputBuffer = this.inputHistory[this.historyIndex];
+        this.inputCursor = this.inputBuffer.length;
+        this.popoverDismissedFor = this.inputBuffer;
+        this.render();
+      }
+      return;
+    }
+    if (key.name === "down") {
+      this.focusArea = "prompt";
+      if (this.historyIndex > 0) {
+        this.historyIndex--;
+        this.inputBuffer = this.inputHistory[this.historyIndex];
+        this.inputCursor = this.inputBuffer.length;
+        this.popoverDismissedFor = this.inputBuffer;
+        this.render();
+      } else if (this.historyIndex === 0) {
+        this.historyIndex = -1;
+        this.inputBuffer = this.historyDraft;
+        this.inputCursor = this.inputBuffer.length;
+        this.popoverDismissedFor = this.inputBuffer;
+        this.render();
+      }
+      return;
+    }
+
+    if (str && !key.ctrl && !key.meta && /^[\x20-\x7e]+$/.test(str)) {
+      this.focusArea = "prompt";
+      this.historyIndex = -1;
+      this.popoverDismissedFor = null;
+      this.inputBuffer =
+        this.inputBuffer.slice(0, this.inputCursor) +
+        str +
+        this.inputBuffer.slice(this.inputCursor);
+      this.inputCursor += str.length;
+      this.popoverIndex = 0;
+      this.render();
+    }
+  }
+
   private async executeSubmittedLine(line: string): Promise<void> {
     try {
       if (line.startsWith("/")) {
@@ -359,14 +1468,26 @@ export class YedoguTui {
           this.shutdown();
           return;
         }
+      } else if (line.startsWith("!") && line.length > 1) {
+        const cmd = line.slice(1).trim();
+        this.emitOut(renderToolStart("shell", { command: cmd }));
+        this.startSpinnerFs(`$ ${truncatePlain(cmd, 42)}…`);
+        const res = await executeShell(cmd, this.engine.session.workspace, 60000);
+        this.stopSpinnerFs();
+        const combined = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+        this.emitOut(renderToolDone("shell", res.exitCode === 0, res.durationMs, combined || `(exit ${res.exitCode})`, this.diffViewMode));
       } else {
-        await this.engine.sendPrompt(line);
+        this.undoStack.push(structuredClone(this.engine.session.messages));
+        if (this.undoStack.length > 30) this.undoStack.shift();
+        this.redoStack = [];
+        const enriched = this.expandAtFileReferences(line);
+        await this.engine.sendPrompt(enriched);
       }
     } catch (err) {
-      this.spinner.stop(true);
+      this.stopSpinnerFs();
       this.markdown.flush();
       const friendly = formatFriendlyError(err).split(/\r?\n/);
-      process.stdout.write(
+      this.emitOut(
         `\n  ${c(PALETTE.danger + PALETTE.bold, "✗")} ${c(PALETTE.text, friendly[0])}\n` +
           friendly
             .slice(1)
@@ -375,7 +1496,35 @@ export class YedoguTui {
       );
     }
 
-    this.prompt(true);
+    if (!this.fullScreenActive) {
+      this.prompt(true);
+    }
+  }
+
+  private expandAtFileReferences(input: string): string {
+    const tokens = input.match(/@([^\s]+)/g);
+    if (!tokens || tokens.length === 0) return input;
+    const agentIds = new Set(this.engine.getAgents().map((a) => a.id));
+    const attachedBlocks: string[] = [];
+    for (const tok of tokens) {
+      const candidate = tok.slice(1);
+      if (agentIds.has(candidate)) continue;
+      const abs = path.isAbsolute(candidate)
+        ? candidate
+        : path.resolve(this.engine.session.workspace, candidate);
+      try {
+        if (fs.existsSync(abs) && fs.statSync(abs).isFile() && fs.statSync(abs).size < 256 * 1024) {
+          const content = fs.readFileSync(abs, "utf8");
+          if (!content.includes("\0")) {
+            attachedBlocks.push(`<file path="${candidate}">\n${content.slice(0, 12000)}\n</file>`);
+          }
+        }
+      } catch {
+        // ignore unreadable paths
+      }
+    }
+    if (attachedBlocks.length === 0) return input;
+    return `${input}\n\n${attachedBlocks.join("\n\n")}`;
   }
 
   private getCursorCol(): number {
@@ -402,7 +1551,7 @@ export class YedoguTui {
       this.placeholderVisible = false;
     }
 
-    const footer = renderComposerFooter();
+    const footer = this.leader.isArmed ? this.leader.renderHintBar() : renderComposerFooter();
     buf += `\r\n${footer}\x1b[K\x1b[1A\x1b[${Math.max(1, cursorCol)}G`;
     buf += SYNC_END;
     process.stdout.write(buf);
@@ -454,12 +1603,181 @@ export class YedoguTui {
   /**
    * Launches an interactive floating SelectModal and suspends readline until resolved.
    */
-  private runSelectModal<T>(config: SelectModalConfig<T>): Promise<ModalOutcome<T>> {
+  private runSelectModal<T>(
+    config: SelectModalConfig<T> & { onHover?: (selected: SelectOption<T> | undefined) => void },
+  ): Promise<ModalOutcome<T>> {
     return new Promise((resolve) => {
       if (!process.stdout.isTTY) {
         resolve({ action: "cancel" });
         return;
       }
+
+      if (this.fullScreenActive) {
+        let query = "";
+        let options = [...config.options];
+        let filtered = [...options];
+        let selectedIndex =
+          config.initialIndex !== undefined && config.initialIndex >= 0 && config.initialIndex < filtered.length
+            ? config.initialIndex
+            : Math.max(0, filtered.findIndex((o) => o.active));
+        let subtitle = config.subtitle ?? "";
+        let footerHint =
+          config.footerHints ??
+          (config.onTab ? "↑↓ move · ↵ select · tab mode · esc close" : "↑↓ move · ↵ select · esc close");
+
+        const applyFilter = () => {
+          filtered = filterSelectOptions(options, query);
+          if (selectedIndex >= filtered.length) selectedIndex = 0;
+          config.onHover?.(filtered[selectedIndex]);
+        };
+
+        const closeOverlay = (outcome: ModalOutcome<T>) => {
+          this.overlayRender = null;
+          this.overlayKeyHandler = null;
+          this.render();
+          resolve(outcome);
+        };
+
+        this.overlayRender = () => {
+          const { cols, rows } = this.screen.size;
+          const modalW = Math.min(config.width ?? 70, Math.max(46, cols - 6));
+          const innerW = modalW - 4;
+          const footerPanel = config.renderFooterPanel
+            ? config.renderFooterPanel(filtered[selectedIndex], innerW)
+            : undefined;
+          const modalOpts: OpenCodeModalOption<T>[] = filtered.map((o) => ({
+            value: o.value,
+            label: o.label,
+            description: o.description,
+            badge: o.badge,
+            badgeColor: o.badgeColor,
+            badgeRaw: o.badgeRaw,
+            checked: o.checked ?? o.active,
+            category: o.category,
+            keywords: o.keywords,
+          }));
+          const rendered = renderOpenCodeModal({
+            title: subtitle ? `${config.title} · ${subtitle}` : config.title,
+            width: modalW,
+            maxRows: Math.max(4, Math.min(config.maxVisible ?? 12, rows - 10)),
+            searchable: config.searchable !== false,
+            searchPlaceholder: config.placeholder ?? "Search",
+            query,
+            options: modalOpts,
+            selectedIndex,
+            footerPanel,
+            footerHint,
+          });
+          return {
+            lines: rendered.lines,
+            width: modalW,
+            cursorRow: rendered.cursorRowOffset,
+            cursorCol: rendered.cursorColOffset,
+            scrollbarRowOffset: rendered.scrollbarRowOffset,
+            scrollbarHeight: rendered.scrollbarHeight,
+            totalItems: filtered.length,
+            onScrub: (idx: number) => {
+              selectedIndex = Math.max(0, Math.min(filtered.length - 1, idx));
+              config.onHover?.(filtered[selectedIndex]);
+              this.render();
+            },
+          };
+        };
+
+        this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
+          if (key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d"))) {
+            closeOverlay({ action: "cancel" });
+            return;
+          }
+          if (key.name === "return" || key.name === "enter") {
+            const chosen = filtered[selectedIndex];
+            if (!chosen) return;
+            closeOverlay({ action: "select", value: chosen.value, option: chosen });
+            return;
+          }
+          if (key.name === "up" || (key.ctrl && key.name === "p")) {
+            if (filtered.length > 0) {
+              selectedIndex = (selectedIndex - 1 + filtered.length) % filtered.length;
+              config.onHover?.(filtered[selectedIndex]);
+              this.render();
+            }
+            return;
+          }
+          if (key.name === "down" || (key.ctrl && key.name === "n")) {
+            if (filtered.length > 0) {
+              selectedIndex = (selectedIndex + 1) % filtered.length;
+              config.onHover?.(filtered[selectedIndex]);
+              this.render();
+            }
+            return;
+          }
+          if (key.name === "pageup") {
+            if (filtered.length > 0) {
+              selectedIndex = Math.max(0, selectedIndex - 6);
+              config.onHover?.(filtered[selectedIndex]);
+              this.render();
+            }
+            return;
+          }
+          if (key.name === "pagedown") {
+            if (filtered.length > 0) {
+              selectedIndex = Math.min(filtered.length - 1, selectedIndex + 6);
+              config.onHover?.(filtered[selectedIndex]);
+              this.render();
+            }
+            return;
+          }
+          if (key.name === "left" && config.onLeftRight) {
+            config.onLeftRight(-1, filtered[selectedIndex]);
+            this.render();
+            return;
+          }
+          if (key.name === "right" && config.onLeftRight) {
+            config.onLeftRight(1, filtered[selectedIndex]);
+            this.render();
+            return;
+          }
+          if (key.name === "tab" && config.onTab) {
+            const patch = config.onTab();
+            if (patch) {
+              if (patch.subtitle !== undefined) subtitle = patch.subtitle;
+              if (patch.footerHints !== undefined) footerHint = patch.footerHints;
+              if (patch.options) {
+                options = [...patch.options];
+                applyFilter();
+              }
+            }
+            this.render();
+            return;
+          }
+          if (config.searchable === false) return;
+          if (key.name === "backspace") {
+            if (query.length > 0) {
+              query = query.slice(0, -1);
+              applyFilter();
+              this.render();
+            }
+            return;
+          }
+          if (key.ctrl && key.name === "u") {
+            if (query.length > 0) {
+              query = "";
+              applyFilter();
+              this.render();
+            }
+            return;
+          }
+          if (str && !key.ctrl && !key.meta && /^[\x20-\x7e]+$/.test(str)) {
+            query += str;
+            applyFilter();
+            this.render();
+          }
+        };
+
+        this.render();
+        return;
+      }
+
       this.clearDecorations(true);
       this.slashMenu.reset();
       const modal = new SelectModal<T>(config, (outcome) => {
@@ -477,6 +1795,100 @@ export class YedoguTui {
         resolve({ action: "cancel" });
         return;
       }
+
+      if (this.fullScreenActive) {
+        let value = config.initialValue ?? "";
+        let errorMsg = "";
+
+        const closeOverlay = (outcome: InputOutcome) => {
+          this.overlayRender = null;
+          this.overlayKeyHandler = null;
+          this.render();
+          resolve(outcome);
+        };
+
+        this.overlayRender = () => {
+          const { cols } = this.screen.size;
+          const modalW = Math.min(config.width ?? 68, Math.max(46, cols - 6));
+          const innerW = modalW - 4;
+          const modalBg = PALETTE.pillBg;
+          const lines: string[] = [];
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          const titleStr = c(PALETTE.text + PALETTE.bold, truncatePlain(config.subtitle ? `${config.title} · ${config.subtitle}` : config.title, innerW - 6));
+          const escStr = c(PALETTE.muted, "esc");
+          const gap = Math.max(1, innerW - visibleLength(titleStr) - visibleLength(escStr));
+          lines.push(paintSurfaceLine(`  ${titleStr}${" ".repeat(gap)}${escStr}  `, modalW, modalBg));
+
+          if (config.steps?.length) {
+            lines.push(paintSurfaceLine("", modalW, modalBg));
+            config.steps.forEach((st, i) => {
+              lines.push(paintSurfaceLine(`  ${c(PALETTE.accent, `${i + 1}.`)} ${c(PALETTE.secondary, truncatePlain(st, innerW - 4))}`, modalW, modalBg));
+            });
+          }
+
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          if (config.fieldLabel) {
+            lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, config.fieldLabel)}`, modalW, modalBg));
+          }
+          const shown = config.secret ? "•".repeat(value.length) : value;
+          const fieldText = shown
+            ? c(PALETTE.text, truncatePlain(shown, innerW - 4))
+            : c(PALETTE.muted, truncatePlain(config.placeholder ?? "Type value…", innerW - 4));
+          const cursorRow = lines.length;
+          const cursorCol = 3 + Math.min(shown.length, innerW - 4);
+          lines.push(`${c(PALETTE.accent, "┃")}${paintSurfaceLine(`  ${fieldText}`, modalW - 1, PALETTE.surfaceActiveBg)}`);
+
+          if (errorMsg) {
+            lines.push(paintSurfaceLine(`  ${c(PALETTE.danger, truncatePlain(errorMsg, innerW))}`, modalW, modalBg));
+          } else if (config.hint) {
+            lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, truncatePlain(config.hint, innerW))}`, modalW, modalBg));
+          }
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, config.footerHints ?? "enter submit · esc cancel")}`, modalW, modalBg));
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          return { lines, width: modalW, cursorRow, cursorCol };
+        };
+
+        this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
+          if (key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d"))) {
+            closeOverlay({ action: "cancel" });
+            return;
+          }
+          if (key.name === "return" || key.name === "enter") {
+            const err = config.validate?.(value.trim());
+            if (err) {
+              errorMsg = err;
+              this.render();
+              return;
+            }
+            closeOverlay({ action: "submit", value: value.trim() });
+            return;
+          }
+          if (key.name === "backspace") {
+            if (value.length > 0) {
+              value = value.slice(0, -1);
+              errorMsg = "";
+              this.render();
+            }
+            return;
+          }
+          if (key.ctrl && key.name === "u") {
+            value = "";
+            errorMsg = "";
+            this.render();
+            return;
+          }
+          if (str && !key.ctrl && !key.meta && /^[\x20-\x7e]+$/.test(str)) {
+            value += str;
+            errorMsg = "";
+            this.render();
+          }
+        };
+
+        this.render();
+        return;
+      }
+
       this.clearDecorations(true);
       this.slashMenu.reset();
       const modal = new InputModal(config, (outcome) => {
@@ -494,6 +1906,130 @@ export class YedoguTui {
         resolve({ action: "cancel" });
         return;
       }
+
+      if (this.fullScreenActive) {
+        const values: Record<string, string> = {};
+        for (const f of config.fields) values[f.id] = f.initialValue ?? "";
+        let activeIdx = 0;
+        let errorMsg = "";
+
+        const closeOverlay = (outcome: FormOutcome) => {
+          this.overlayRender = null;
+          this.overlayKeyHandler = null;
+          this.render();
+          resolve(outcome);
+        };
+
+        this.overlayRender = () => {
+          const { cols } = this.screen.size;
+          const modalW = Math.min(config.width ?? 72, Math.max(48, cols - 6));
+          const innerW = modalW - 4;
+          const modalBg = PALETTE.pillBg;
+          const lines: string[] = [];
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          const titleStr = c(PALETTE.text + PALETTE.bold, truncatePlain(config.subtitle ? `${config.title} · ${config.subtitle}` : config.title, innerW - 6));
+          const escStr = c(PALETTE.muted, "esc");
+          const gap = Math.max(1, innerW - visibleLength(titleStr) - visibleLength(escStr));
+          lines.push(paintSurfaceLine(`  ${titleStr}${" ".repeat(gap)}${escStr}  `, modalW, modalBg));
+
+          if (config.steps?.length) {
+            lines.push(paintSurfaceLine("", modalW, modalBg));
+            config.steps.forEach((st, i) => {
+              lines.push(paintSurfaceLine(`  ${c(PALETTE.accent, `${i + 1}.`)} ${c(PALETTE.secondary, truncatePlain(st, innerW - 4))}`, modalW, modalBg));
+            });
+          }
+
+          let cursorRow = 0;
+          let cursorCol = 3;
+          config.fields.forEach((f, idx) => {
+            lines.push(paintSurfaceLine("", modalW, modalBg));
+            lines.push(paintSurfaceLine(`  ${c(idx === activeIdx ? PALETTE.text + PALETTE.bold : PALETTE.muted, f.label)}`, modalW, modalBg));
+            const raw = values[f.id] ?? "";
+            const shown = f.secret ? "•".repeat(raw.length) : raw;
+            const txt = shown ? c(PALETTE.text, truncatePlain(shown, innerW - 4)) : c(PALETTE.muted, truncatePlain(f.placeholder ?? "", innerW - 4));
+            if (idx === activeIdx) {
+              cursorRow = lines.length;
+              cursorCol = 3 + Math.min(shown.length, innerW - 4);
+              lines.push(`${c(PALETTE.accent, "┃")}${paintSurfaceLine(`  ${txt}`, modalW - 1, PALETTE.surfaceActiveBg)}`);
+            } else {
+              lines.push(paintSurfaceLine(`  ${txt}`, modalW, modalBg));
+            }
+          });
+
+          if (errorMsg) {
+            lines.push(paintSurfaceLine("", modalW, modalBg));
+            lines.push(paintSurfaceLine(`  ${c(PALETTE.danger, truncatePlain(errorMsg, innerW))}`, modalW, modalBg));
+          } else if (config.callout) {
+            lines.push(paintSurfaceLine("", modalW, modalBg));
+            lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, truncatePlain(config.callout, innerW))}`, modalW, modalBg));
+          }
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          lines.push(paintSurfaceLine(`  ${c(PALETTE.muted, config.footerHints ?? "tab/↑↓ switch field · enter next/submit · esc cancel")}`, modalW, modalBg));
+          lines.push(paintSurfaceLine("", modalW, modalBg));
+          return { lines, width: modalW, cursorRow, cursorCol };
+        };
+
+        this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
+          if (key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d"))) {
+            closeOverlay({ action: "cancel" });
+            return;
+          }
+          if (key.name === "tab" || key.name === "down") {
+            activeIdx = (activeIdx + 1) % config.fields.length;
+            this.render();
+            return;
+          }
+          if (key.name === "up") {
+            activeIdx = (activeIdx - 1 + config.fields.length) % config.fields.length;
+            this.render();
+            return;
+          }
+          const field = config.fields[activeIdx];
+          if (key.name === "return" || key.name === "enter") {
+            const val = (values[field.id] ?? "").trim();
+            const err = field.validate?.(val);
+            if (err) {
+              errorMsg = err;
+              this.render();
+              return;
+            }
+            if (activeIdx < config.fields.length - 1) {
+              activeIdx++;
+              errorMsg = "";
+              this.render();
+              return;
+            }
+            const trimmed: Record<string, string> = {};
+            for (const f of config.fields) trimmed[f.id] = (values[f.id] ?? "").trim();
+            closeOverlay({ action: "submit", values: trimmed });
+            return;
+          }
+          if (key.name === "backspace") {
+            const cur = values[field.id] ?? "";
+            if (cur.length > 0) {
+              values[field.id] = cur.slice(0, -1);
+              errorMsg = "";
+              this.render();
+            }
+            return;
+          }
+          if (key.ctrl && key.name === "u") {
+            values[field.id] = "";
+            errorMsg = "";
+            this.render();
+            return;
+          }
+          if (str && !key.ctrl && !key.meta && /^[\x20-\x7e]+$/.test(str)) {
+            values[field.id] = (values[field.id] ?? "") + str;
+            errorMsg = "";
+            this.render();
+          }
+        };
+
+        this.render();
+        return;
+      }
+
       this.clearDecorations(true);
       this.slashMenu.reset();
       const modal = new FormModal(config, (outcome) => {
@@ -509,6 +2045,61 @@ export class YedoguTui {
     return new Promise((resolve) => {
       if (!process.stdout.isTTY) {
         resolve({ confirmed: false });
+        return;
+      }
+
+      if (this.fullScreenActive) {
+        let selectedIndex = 0;
+        const closeOverlay = (confirmed: boolean) => {
+          this.overlayRender = null;
+          this.overlayKeyHandler = null;
+          this.render();
+          resolve({ confirmed });
+        };
+
+        this.overlayRender = () => {
+          const { cols } = this.screen.size;
+          const modalW = Math.min(56, Math.max(44, cols - 6));
+          const rendered = renderOpenCodeModal({
+            title: config.title,
+            width: modalW,
+            searchable: false,
+            options: [
+              { value: "no", label: config.cancelLabel ?? "Cancel", badge: "n" },
+              {
+                value: "yes",
+                label: config.confirmLabel ?? "Confirm",
+                badge: "y",
+                badgeColor: config.danger ? PALETTE.danger : PALETTE.success,
+              },
+            ],
+            selectedIndex,
+            footerPanel: [c(PALETTE.secondary, config.message)],
+            footerHint: "↑↓/←→ choose · enter confirm · esc cancel",
+          });
+          return { lines: rendered.lines, width: modalW };
+        };
+
+        this.overlayKeyHandler = (str: string, key: readline.Key = {}) => {
+          if (key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d")) || str.toLowerCase() === "n") {
+            closeOverlay(false);
+            return;
+          }
+          if (str.toLowerCase() === "y") {
+            closeOverlay(true);
+            return;
+          }
+          if (key.name === "up" || key.name === "down" || key.name === "left" || key.name === "right" || key.name === "tab") {
+            selectedIndex = selectedIndex === 0 ? 1 : 0;
+            this.render();
+            return;
+          }
+          if (key.name === "return" || key.name === "enter") {
+            closeOverlay(selectedIndex === 1);
+          }
+        };
+
+        this.render();
         return;
       }
       this.clearDecorations(true);
@@ -564,13 +2155,45 @@ export class YedoguTui {
         return;
       }
 
-      // 2. Global keyboard shortcuts (tooey.design / termcn.dev / OpenCode)
-      if (key.ctrl && key.name === "k") {
+      // 2. OpenCode <leader> (Ctrl+X) chord resolution
+      if (this.leader.isArmed) {
+        const action = this.leader.resolveChord(s, key);
+        if (action === "cancel") {
+          this.drawIdleDecorations();
+          return;
+        }
+        if (action) {
+          this.triggerHotkeyFlow(origTtyWrite, () => this.dispatchKeybindAction(action));
+          return;
+        }
+        this.drawIdleDecorations();
+      }
+
+      if (key.ctrl && key.name === "x") {
+        this.leader.arm();
+        this.drawIdleDecorations();
+        return;
+      }
+
+      // 3. Global keyboard shortcuts (OpenCode + Yedogu)
+      if (key.ctrl && (key.name === "k" || key.name === "p")) {
         this.triggerHotkeyFlow(origTtyWrite, () => this.openCommandPalette());
         return;
       }
-      if (key.ctrl && key.name === "p") {
-        this.triggerHotkeyFlow(origTtyWrite, () => this.openModelPicker());
+      if (key.shift && key.name === "tab") {
+        this.triggerHotkeyFlow(origTtyWrite, async () => {
+          this.cycleActiveAgent(1);
+        });
+        return;
+      }
+      if (key.name === "f2") {
+        this.triggerHotkeyFlow(origTtyWrite, async () => {
+          this.cycleRecentModel(key.shift ? -1 : 1);
+        });
+        return;
+      }
+      if (key.ctrl && key.name === "r") {
+        this.triggerHotkeyFlow(origTtyWrite, () => this.renameCurrentSession());
         return;
       }
       if (key.ctrl && key.name === "g") {
@@ -756,9 +2379,15 @@ export class YedoguTui {
     const activeTheme = getActiveTheme();
 
     const options: SelectOption<string>[] = [
-      { value: "popup:model", label: "Switch Model / Pin to Agent", description: this.engine.getEffectiveModelForAgent(activeAgent), badge: "^P", badgeColor: PALETTE.accentSoft, keywords: "model llm gpt claude gemini" },
-      { value: "popup:agent", label: "Switch Specialist @Agent", description: `Current: @${activeAgent}`, badge: "^G", badgeColor: PALETTE.accentSoft, keywords: "agent recon reverser web-hunter" },
-      { value: "popup:theme", label: "Switch Color Theme", description: `Current: ${activeTheme.name}`, badge: "^T", badgeColor: PALETTE.accentSoft, keywords: "theme color catppuccin tokyonight gruvbox nord" },
+      { value: "popup:model", label: "Switch Model / Pin to Agent", description: this.engine.getEffectiveModelForAgent(activeAgent), badge: "<leader>m / F2", badgeColor: PALETTE.accentSoft, keywords: "model llm gpt claude gemini" },
+      { value: "popup:reasoning", label: "Switch Reasoning Effort", description: `Current: ${this.engine.session.reasoningEffort || this.engine.config.reasoningEffort || "medium"}`, badge: "/effort · ^E", badgeColor: PALETTE.reasoning, keywords: "reasoning effort thinking none low medium high xhigh" },
+      { value: "popup:agent", label: "Switch Specialist @Agent", description: `Current: @${activeAgent}`, badge: "<leader>a / S-Tab", badgeColor: PALETTE.accentSoft, keywords: "agent recon reverser web-hunter" },
+      { value: "popup:theme", label: "Switch Color Theme (37 OpenCode Themes)", description: `Current: ${activeTheme.name}`, badge: "<leader>t / ^T", badgeColor: PALETTE.accentSoft, keywords: "theme color catppuccin tokyonight gruvbox nord opencode" },
+      { value: "cmd:/sidebar", label: "Toggle Right Sidebar Panel", description: `Mode: ${this.sidebarMode}`, badge: "<leader>b", badgeColor: PALETTE.info, keywords: "sidebar panel layout split" },
+      { value: "popup:timeline", label: "Session Timeline (Jump / Revert / Fork)", description: `${this.engine.session.messages.length} messages`, badge: "<leader>g", badgeColor: PALETTE.info, keywords: "timeline revert fork jump history" },
+      { value: "cmd:/diff", label: "View Modified Files & Split/Unified Diff", description: `${this.engine.session.modifiedFiles?.length ?? 0} edited files · ${this.diffViewMode}`, badge: "<leader>d", badgeColor: PALETTE.info, keywords: "diff patch split unified edit" },
+      { value: "cmd:/todos", label: "View Session # Todos Checklist", description: `${this.engine.session.todos?.length ?? 0} todos`, badge: "<leader>v", badgeColor: PALETTE.success, keywords: "todos checklist plan" },
+      { value: "popup:settings", label: "TUI Settings (Sidebar, Diff View, Theme)", description: `sidebar=${this.sidebarMode} · diff=${this.diffViewMode}`, badge: "<leader>,", badgeColor: PALETTE.accentSoft, keywords: "settings preferences config" },
       { value: "cmd:/browser", label: "Open WebTUI Browser War-Room", description: this.daemon.url, badge: "^B", badgeColor: PALETTE.info, keywords: "browser web ui war-room" },
       { value: "popup:channels", label: "Connect Messaging Bots (Telegram / Discord / Slack)", description: `${this.engine.channels.getPublicViews().filter((ch) => ch.status.state === "connected").length} connected · text YEDOGU remotely`, badge: "⊞", badgeColor: PALETTE.info, keywords: "channels bot telegram discord slack webhook chat remote" },
       { value: "popup:providers", label: "Connect / Manage LLM Providers", description: "Enter API keys with masked input", badge: "⊞", badgeColor: PALETTE.success, keywords: "providers connect api key token" },
@@ -783,6 +2412,7 @@ export class YedoguTui {
 
     const v = res.value;
     if (v === "popup:model") await this.openModelPicker();
+    else if (v === "popup:reasoning") await this.openReasoningPicker();
     else if (v === "popup:agent") await this.openAgentPicker();
     else if (v === "popup:theme") await this.openThemePicker();
     else if (v === "popup:channels") await this.openChannelsManager();
@@ -791,7 +2421,291 @@ export class YedoguTui {
     else if (v === "popup:sessions") await this.openSessionPicker();
     else if (v === "popup:findings") await this.openFindingsPicker();
     else if (v === "popup:report") await this.openReportPicker();
+    else if (v === "popup:timeline") await this.openTimelinePicker();
+    else if (v === "popup:settings") await this.openSettingsModal();
     else if (v.startsWith("cmd:")) await this.handleSlashCommand(v.slice(4));
+  }
+
+  private async dispatchKeybindAction(action: KeybindActionId): Promise<void> {
+    switch (action) {
+      case "command_list":
+        await this.openCommandPalette();
+        break;
+      case "sidebar_toggle":
+        await this.handleSlashCommand("/sidebar");
+        break;
+      case "model_list":
+        await this.openModelPicker();
+        break;
+      case "model_cycle_recent":
+        this.cycleRecentModel(1);
+        break;
+      case "agent_list":
+        await this.openAgentPicker();
+        break;
+      case "agent_cycle":
+        this.cycleActiveAgent(1);
+        break;
+      case "theme_list":
+        await this.openThemePicker();
+        break;
+      case "session_new":
+        await this.handleSlashCommand("/new");
+        break;
+      case "session_list":
+        await this.openSessionPicker();
+        break;
+      case "session_timeline":
+        await this.openTimelinePicker();
+        break;
+      case "session_compact":
+        await this.handleSlashCommand("/compact");
+        break;
+      case "session_export":
+        await this.handleSlashCommand("/export");
+        break;
+      case "session_rename":
+        await this.renameCurrentSession();
+        break;
+      case "session_fork":
+        await this.handleSlashCommand("/fork");
+        break;
+      case "status_view":
+        await this.handleSlashCommand("/status");
+        break;
+      case "editor_open":
+        await this.handleSlashCommand("/editor");
+        break;
+      case "messages_undo":
+        await this.handleSlashCommand("/undo");
+        break;
+      case "messages_redo":
+        await this.handleSlashCommand("/redo");
+        break;
+      case "messages_copy":
+        await this.handleSlashCommand("/yank");
+        break;
+      case "prompt_stash":
+        await this.openStashPicker();
+        break;
+      case "diff_open":
+        await this.handleSlashCommand("/diff");
+        break;
+      case "todos_view":
+        await this.handleSlashCommand("/todos");
+        break;
+      case "browser_open":
+        await this.handleSlashCommand("/browser");
+        break;
+      case "settings_open":
+        await this.openSettingsModal();
+        break;
+      case "help_show":
+        process.stdout.write(renderHelpText());
+        break;
+      case "app_exit":
+        await this.shutdown();
+        break;
+    }
+  }
+
+  private cycleActiveAgent(delta: 1 | -1): void {
+    const agents = this.engine.getAgents();
+    if (agents.length === 0) return;
+    const idx = agents.findIndex((a) => a.id === this.engine.session.activeAgent);
+    const next = agents[(idx + delta + agents.length) % agents.length];
+    const switched = this.engine.setActiveAgent(next.id);
+    process.stdout.write(
+      `\n  ${c(PALETTE.success, "✓")} Agent → ${c(PALETTE.accent + PALETTE.bold, `@${switched.id}`)} ${c(PALETTE.muted, `· ${switched.title}`)}\n`,
+    );
+  }
+
+  private cycleRecentModel(delta: 1 | -1): void {
+    if (this.recentModels.length <= 1) {
+      const connected = this.engine.getConnectedProviders();
+      const allModels = connected.flatMap((p) => p.models.map((m) => `${p.id}/${m.id}`));
+      for (const m of allModels.slice(0, 6)) {
+        if (!this.recentModels.includes(m)) this.recentModels.push(m);
+      }
+    }
+    if (this.recentModels.length === 0) return;
+    const cur = this.engine.session.activeModel;
+    const idx = this.recentModels.indexOf(cur);
+    const next = this.recentModels[(Math.max(0, idx) + delta + this.recentModels.length) % this.recentModels.length];
+    this.engine.setModel(next);
+    process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Model → ${c(PALETTE.text + PALETTE.bold, next)}\n`);
+  }
+
+  private async renameCurrentSession(): Promise<void> {
+    const inp = await this.runInputModal({
+      title: "Rename Session",
+      subtitle: this.engine.session.id,
+      initialValue: this.engine.session.name,
+      placeholder: "Enter new session name…",
+      validate: (v) => (!v.trim() ? "Session name cannot be empty." : null),
+    });
+    if (inp.action !== "submit") return;
+    this.engine.updateSession(this.engine.session.id, { name: inp.value.trim() });
+    process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Session renamed to ${c(PALETTE.text + PALETTE.bold, inp.value.trim())}\n`);
+  }
+
+  private async openTimelinePicker(): Promise<void> {
+    const msgs = this.engine.session.messages;
+    if (msgs.length === 0) {
+      process.stdout.write(`\n  ${c(PALETTE.muted, "· No messages in session timeline yet.")}\n`);
+      return;
+    }
+    const options: SelectOption<number>[] = msgs.map((m, idx) => ({
+      value: idx,
+      label: `${m.role === "user" ? "❯" : "✦"} ${truncatePlain(m.content.replace(/\s+/g, " "), 46)}`,
+      description: `${m.agentId ? `@${m.agentId} · ` : ""}${m.timestamp.slice(11, 19)}`,
+      badge: `#${idx + 1}`,
+      badgeColor: m.role === "user" ? PALETTE.accent : PALETTE.info,
+    }));
+    const res = await this.runSelectModal({
+      title: "Session Timeline",
+      subtitle: `${msgs.length} messages`,
+      placeholder: "Search messages…",
+      options,
+    });
+    if (res.action !== "select") return;
+    const msgIdx = res.value;
+    const act = await this.runSelectModal({
+      title: `Message #${msgIdx + 1} Actions`,
+      subtitle: msgs[msgIdx].role,
+      searchable: false,
+      options: [
+        { value: "copy", label: "Copy Message to Clipboard", description: "Copy via OSC 52 & system clipboard", badge: "y" },
+        { value: "fork", label: "Fork Session From Here", description: "Branch a new session up to this message", badge: "f", badgeColor: PALETTE.info },
+        { value: "revert", label: "Revert Session To Here", description: "Truncate messages after this point (undoable)", badge: "u", badgeColor: PALETTE.warning },
+      ],
+    });
+    if (act.action !== "select") return;
+    if (act.value === "copy") {
+      this.copyTextToClipboard(msgs[msgIdx].content);
+    } else if (act.value === "fork") {
+      const forkedName = `${this.engine.session.name || "Session"} (fork #${msgIdx + 1})`;
+      const snapshot = structuredClone(msgs.slice(0, msgIdx + 1));
+      const newSess = this.engine.newSession(forkedName);
+      newSess.parentSessionId = this.engine.session.id;
+      newSess.messages = snapshot;
+      process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Forked into ${c(PALETTE.info, newSess.id)} (${snapshot.length} msgs)\n`);
+    } else if (act.value === "revert") {
+      this.undoStack.push(structuredClone(this.engine.session.messages));
+      this.redoStack = [];
+      this.engine.session.messages = msgs.slice(0, msgIdx + 1);
+      process.stdout.write(`\n  ${c(PALETTE.warning, "✓")} Reverted timeline to message #${msgIdx + 1} (/redo to restore)\n`);
+    }
+  }
+
+  private async openStashPicker(): Promise<void> {
+    this.engine.session.stashedPrompts ??= [];
+    const stashes = this.engine.session.stashedPrompts;
+    const options: SelectOption<string>[] = [
+      { value: "__save__", label: "+ Stash Current Input / New Draft", description: "Save a draft prompt for later", badge: "save", badgeColor: PALETTE.accent },
+      ...stashes.map((s, i) => ({
+        value: `pop:${i}`,
+        label: truncatePlain(s.replace(/\s+/g, " "), 52),
+        description: `Stash #${i + 1}`,
+        badge: "pop",
+        badgeColor: PALETTE.info,
+      })),
+    ];
+    const res = await this.runSelectModal({
+      title: "Prompt Stash",
+      subtitle: `${stashes.length} saved`,
+      options,
+    });
+    if (res.action !== "select") return;
+    if (res.value === "__save__") {
+      const inp = await this.runInputModal({
+        title: "Stash Draft Prompt",
+        placeholder: "Enter prompt text to stash…",
+        validate: (v) => (!v.trim() ? "Cannot stash empty prompt." : null),
+      });
+      if (inp.action === "submit") {
+        stashes.unshift(inp.value);
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Stashed prompt (${stashes.length} total)\n`);
+      }
+    } else if (res.value.startsWith("pop:")) {
+      const idx = Number(res.value.slice(4));
+      const [popped] = stashes.splice(idx, 1);
+      if (popped) {
+        process.stdout.write(`\n  ${c(PALETTE.info, "→")} Popped stash:\n  ${c(PALETTE.text, popped)}\n`);
+      }
+    }
+  }
+
+  private async openSettingsModal(): Promise<void> {
+    const res = await this.runSelectModal({
+      title: "TUI Settings",
+      subtitle: "OpenCode-style Preferences",
+      searchable: false,
+      options: [
+        { value: "sidebar", label: "Sidebar Mode", description: `Current: ${this.sidebarMode} (auto shows at >120 cols)`, badge: this.sidebarMode, badgeColor: PALETTE.info },
+        { value: "diff", label: "Diff View Mode", description: `Current: ${this.diffViewMode} (auto splits at >120 cols)`, badge: this.diffViewMode, badgeColor: PALETTE.accent },
+        { value: "theme", label: "Color Theme", description: `Current: ${getActiveTheme().name}`, badge: getActiveTheme().id, badgeColor: PALETTE.accentSoft },
+      ],
+    });
+    if (res.action !== "select") return;
+    if (res.value === "sidebar") {
+      const order: Array<"auto" | "show" | "hide"> = ["auto", "show", "hide"];
+      this.sidebarMode = order[(order.indexOf(this.sidebarMode) + 1) % order.length];
+      process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Sidebar mode → ${c(PALETTE.text + PALETTE.bold, this.sidebarMode)}\n`);
+    } else if (res.value === "diff") {
+      const order: Array<"auto" | "split" | "unified"> = ["auto", "split", "unified"];
+      this.diffViewMode = order[(order.indexOf(this.diffViewMode) + 1) % order.length];
+      process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Diff view mode → ${c(PALETTE.text + PALETTE.bold, this.diffViewMode)}\n`);
+    } else if (res.value === "theme") {
+      await this.openThemePicker();
+    }
+  }
+
+  private copyTextToClipboard(text: string): void {
+    if (process.stdout.isTTY) {
+      process.stdout.write(osc52Copy(text));
+    }
+    try {
+      if (process.platform === "win32") {
+        spawnSync("clip", { input: text, encoding: "utf8" });
+      } else if (process.platform === "darwin") {
+        spawnSync("pbcopy", { input: text, encoding: "utf8" });
+      } else {
+        spawnSync("xclip", ["-selection", "clipboard"], { input: text, encoding: "utf8" });
+      }
+    } catch {
+      // OSC 52 already sent
+    }
+    process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Copied ${c(PALETTE.muted, `${text.length} chars`)} to clipboard\n`);
+  }
+
+  private async openReasoningPicker(): Promise<void> {
+    const current = (this.engine.session.reasoningEffort || this.engine.config.reasoningEffort || "medium") as ReasoningEffort;
+    const levels: Array<{ id: ReasoningEffort; label: string; desc: string }> = [
+      { id: "none", label: "None (Off)", desc: "No extended thinking — lowest latency" },
+      { id: "low", label: "Low", desc: "Fastest responses with minimal reasoning overhead" },
+      { id: "medium", label: "Medium", desc: "Balanced speed and reasoning quality (default)" },
+      { id: "high", label: "High", desc: "Deeper reasoning for complex analysis & exploitation" },
+      { id: "xhigh", label: "Extra High (xhigh)", desc: "Maximum reasoning depth for reverse engineering" },
+    ];
+    const res = await this.runSelectModal<ReasoningEffort>({
+      title: "Select Reasoning Effort",
+      subtitle: this.engine.session.activeModel,
+      searchable: false,
+      options: levels.map((l) => ({
+        value: l.id,
+        label: l.label,
+        description: l.desc,
+        badge: l.id === current ? "active" : l.id,
+        badgeColor: l.id === current ? PALETTE.success : PALETTE.muted,
+        active: l.id === current,
+        checked: l.id === current,
+      })),
+      footerHints: "↑↓ move · ↵ set reasoning effort · esc close",
+    });
+    if (res.action !== "select") return;
+    const applied = this.engine.setReasoningEffort(res.value);
+    this.emitOut(`\n  ${c(PALETTE.success, "✓")} Reasoning effort → ${c(PALETTE.reasoning + PALETTE.bold, applied)}\n`);
   }
 
   private async openModelPicker(): Promise<void> {
@@ -810,12 +2724,21 @@ export class YedoguTui {
     // Lazily fetch live models for any connected provider not yet synced
     const needsSync = initialConnected.some((p) => !this.engine.hasLiveModelsCached(p.id));
     if (needsSync) {
-      const spin = new TerminalSpinner();
-      spin.start("Syncing models from connected providers");
-      try {
-        await this.engine.refreshProviderModels();
-      } finally {
-        spin.stop();
+      if (this.fullScreenActive) {
+        this.startSpinnerFs("Syncing models from connected providers");
+        try {
+          await this.engine.refreshProviderModels();
+        } finally {
+          this.stopSpinnerFs();
+        }
+      } else {
+        const spin = new TerminalSpinner();
+        spin.start("Syncing models from connected providers");
+        try {
+          await this.engine.refreshProviderModels();
+        } finally {
+          spin.stop();
+        }
       }
     }
 
@@ -983,6 +2906,10 @@ export class YedoguTui {
     );
     const chosenVariant = chosenGroup.variants[chosenIdx];
     const normalized = this.engine.setModel(chosenVariant.spec, pinToAgent ? activeAgent : undefined);
+    if (!this.recentModels.includes(normalized)) {
+      this.recentModels.unshift(normalized);
+      if (this.recentModels.length > 8) this.recentModels.pop();
+    }
     const effortNote =
       chosenGroup.variants.length > 1
         ? ` ${c(PALETTE.muted, `(${chosenVariant.label})`)}`
@@ -1028,19 +2955,27 @@ export class YedoguTui {
       value: t.id,
       label: t.name,
       description: t.vibe,
-      badge: `${renderThemeSwatch(t)}${t.id === current.id ? ` ${c(PALETTE.accent, "★")}` : ""}`,
+      badge: renderThemeSwatch(t),
       badgeRaw: true,
       active: t.id === current.id,
+      checked: t.id === current.id,
       keywords: `${t.id} ${t.name} ${t.vibe}`,
     }));
 
     const res = await this.runSelectModal({
-      title: "Color Theme",
-      subtitle: `active: ${current.id}`,
-      placeholder: "Filter themes (claude, catppuccin, tokyonight, gruvbox, nord)…",
+      title: "Themes",
+      subtitle: `${themes.length} themes`,
+      placeholder: "Search",
       options,
+      onHover: (opt) => {
+        if (opt?.value) setActiveTheme(opt.value);
+      },
     });
-    if (res.action !== "select") return;
+    if (res.action !== "select") {
+      setActiveTheme(current.id);
+      if (this.fullScreenActive) this.render();
+      return;
+    }
 
     this.applyThemeAndRedraw(res.value);
   }
@@ -1048,6 +2983,10 @@ export class YedoguTui {
   private applyThemeAndRedraw(themeId: string): void {
     const applied = setActiveTheme(themeId);
     this.engine.setTheme(applied.id);
+    if (this.fullScreenActive) {
+      this.render();
+      return;
+    }
     console.clear();
     process.stdout.write(
       renderBanner(
@@ -1056,6 +2995,7 @@ export class YedoguTui {
         this.engine.getProviders(),
         this.daemon.url,
         this.engine.channels.getPublicViews(),
+        { sidebarMode: this.sidebarMode },
       ),
     );
     process.stdout.write(
@@ -1064,46 +3004,151 @@ export class YedoguTui {
   }
 
   private async openProviderManager(): Promise<void> {
+    const popularOrder = ["anthropic", "gemini", "openai", "codex"];
     while (true) {
-      const providers = this.engine.getProviders();
-      const options: SelectOption<ProviderConfig>[] = providers.map((p) => {
-        const connected = isProviderConnected(p);
-        return {
-          value: p,
-          label: p.id,
-          description: p.name,
-          badge: connected
-            ? `● ${p.authSource || "connected"}`
-            : p.local
-              ? "○ local"
-              : "○ connect",
-          badgeColor: connected ? PALETTE.success : PALETTE.muted,
-          active: connected,
-          keywords: `${p.id} ${p.name} ${p.defaultModel}`,
-        };
+      const providers = [...this.engine.getProviders()].sort((a, b) => {
+        if (a.custom && !b.custom) return -1;
+        if (!a.custom && b.custom) return 1;
+        const ia = popularOrder.indexOf(a.id);
+        const ib = popularOrder.indexOf(b.id);
+        if (ia !== -1 && ib !== -1) return ia - ib;
+        if (ia !== -1) return -1;
+        if (ib !== -1) return 1;
+        return a.name.localeCompare(b.name);
       });
+      const options: SelectOption<ProviderConfig | "__add_custom__">[] = [
+        {
+          value: "__add_custom__",
+          label: "+ Add Custom Provider…",
+          description: "OpenAI / Anthropic / Gemini compatible endpoint",
+          badge: "Custom URL",
+          badgeColor: PALETTE.accent,
+          category: "Custom",
+          keywords: "add custom provider url vllm litellm ollama azure openai anthropic gemini",
+        },
+        ...providers.map((p) => {
+          const connected = isProviderConnected(p);
+          const isPopular = popularOrder.includes(p.id);
+          return {
+            value: p as ProviderConfig | "__add_custom__",
+            label: p.name,
+            description: p.id,
+            badge: connected
+              ? p.authSource === "config" || p.authSource === "env"
+                ? "API key"
+                : p.authSource || "Connected"
+              : p.local
+                ? "local"
+                : "",
+            badgeColor: PALETTE.muted,
+            active: connected,
+            checked: connected,
+            category: p.custom ? "Custom" : isPopular ? "Popular" : "Services",
+            keywords: `${p.id} ${p.name} ${p.defaultModel}`,
+          };
+        }),
+      ];
 
       const res = await this.runSelectModal({
-        title: "LLM Providers",
-        subtitle: "Enter to connect, login, or delete",
-        placeholder: "Search providers (gemini, codex, anthropic, openai, deepseek, ollama)…",
+        title: "Connect an integration",
+        placeholder: "Search",
         options,
-        footerHints: "↑↓ move · ↵ manage · esc close",
+        footerHints: "↑↓ move · ↵ connect/manage · esc close",
       });
       if (res.action !== "select") return;
+      if (res.value === "__add_custom__") {
+        const added = await this.openCustomProviderFormModal();
+        if (added) return;
+        continue;
+      }
       const outcome = await this.openConnectKeyModal(res.value, true);
       if (outcome !== "back") return;
     }
   }
 
+  private async openCustomProviderFormModal(existing?: ProviderConfig): Promise<boolean> {
+    const existingExtra = existing
+      ? existing.models
+          .filter((m) => m.id !== existing.defaultModel)
+          .map((m) => m.id)
+          .join(", ")
+      : "";
+    const form = await this.runFormModal({
+      title: existing ? `Edit Custom Provider (${existing.id})` : "Add Custom Provider",
+      subtitle: "OpenAI / Anthropic / Gemini",
+      steps: [
+        "Enter a short provider ID (e.g. `litellm`, `vllm`, `azure`) and protocol (`openai`, `anthropic`, or `gemini`)",
+        "Provide Base URL (e.g. `https://api.example.com/v1`) and Default Model ID",
+      ],
+      callout: "API Key is optional for local endpoints (e.g. vLLM / LM Studio / Ollama).",
+      fields: existing
+        ? [
+            { id: "name", label: "Display Name", initialValue: existing.name, placeholder: "My Custom Provider", validate: (v) => (!v ? "Enter a name." : null) },
+            { id: "protocol", label: "Protocol (openai | anthropic | gemini)", initialValue: existing.protocol, placeholder: "openai", validate: (v) => (!["openai", "anthropic", "gemini"].includes(v.toLowerCase()) ? "Must be openai, anthropic, or gemini." : null) },
+            { id: "baseUrl", label: "Base URL", initialValue: existing.baseUrl, placeholder: "https://api.example.com/v1", validate: (v) => (!/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null) },
+            { id: "apiKey", label: "API Key (leave blank to keep existing)", placeholder: "Optional", secret: true },
+            { id: "defaultModel", label: "Default Model ID", initialValue: existing.defaultModel, placeholder: "gpt-4o", validate: (v) => (!v ? "Enter a default model ID." : null) },
+            { id: "models", label: "Additional Models (comma-separated, optional)", initialValue: existingExtra, placeholder: "model-a, model-b" },
+          ]
+        : [
+            { id: "id", label: "Provider ID", placeholder: "my-vllm", validate: (v) => (!/^[a-z0-9_-]{2,}$/i.test(v) ? "Use 2+ alphanumeric, dash, or underscore chars." : null) },
+            { id: "name", label: "Display Name", placeholder: "My Custom Endpoint", validate: (v) => (!v ? "Enter a display name." : null) },
+            { id: "protocol", label: "Protocol (openai | anthropic | gemini)", initialValue: "openai", placeholder: "openai", validate: (v) => (!["openai", "anthropic", "gemini"].includes(v.toLowerCase()) ? "Must be openai, anthropic, or gemini." : null) },
+            { id: "baseUrl", label: "Base URL", placeholder: "https://api.example.com/v1", validate: (v) => (!/^https?:\/\//i.test(v) ? "Enter a valid http(s) URL." : null) },
+            { id: "apiKey", label: "API Key (optional for local)", placeholder: "sk-... (leave blank if none)", secret: true },
+            { id: "defaultModel", label: "Default Model ID", placeholder: "gpt-4o", validate: (v) => (!v ? "Enter a default model ID." : null) },
+            { id: "models", label: "Additional Models (comma-separated, optional)", placeholder: "model-a, model-b" },
+          ],
+    });
+    if (form.action !== "submit") return false;
+    const extraModels = (form.values.models || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const proto = form.values.protocol.toLowerCase() as ProviderProtocol;
+    if (existing) {
+      const updated = this.engine.updateCustomProvider(existing.id, {
+        name: form.values.name,
+        protocol: proto,
+        baseUrl: form.values.baseUrl,
+        apiKey: form.values.apiKey || undefined,
+        defaultModel: form.values.defaultModel,
+        models: extraModels,
+      });
+      await this.syncAndPrintConnectedProvider(updated);
+      return true;
+    }
+    const created = this.engine.addCustomProvider({
+      id: form.values.id,
+      name: form.values.name,
+      protocol: proto,
+      baseUrl: form.values.baseUrl,
+      apiKey: form.values.apiKey || undefined,
+      defaultModel: form.values.defaultModel,
+      models: extraModels,
+    });
+    this.engine.setModel(`${created.id}/${created.defaultModel}`);
+    await this.syncAndPrintConnectedProvider(created);
+    return true;
+  }
+
   private async syncAndPrintConnectedProvider(provider: ProviderConfig): Promise<void> {
-    const spin = new TerminalSpinner();
-    spin.start(`Syncing live models for ${provider.name}`);
     let results: Array<{ providerId: string; count: number; live: boolean; error?: string }> = [];
-    try {
-      results = await this.engine.refreshProviderModels(provider.id);
-    } finally {
-      spin.stop();
+    if (this.fullScreenActive) {
+      this.startSpinnerFs(`Syncing live models for ${provider.name}`);
+      try {
+        results = await this.engine.refreshProviderModels(provider.id);
+      } finally {
+        this.stopSpinnerFs();
+      }
+    } else {
+      const spin = new TerminalSpinner();
+      spin.start(`Syncing live models for ${provider.name}`);
+      try {
+        results = await this.engine.refreshProviderModels(provider.id);
+      } finally {
+        spin.stop();
+      }
     }
 
     const updated = this.engine.getProviders().find((p) => p.id === provider.id) ?? provider;
@@ -1154,13 +3199,22 @@ export class YedoguTui {
 
     // For Google Antigravity (agy), check if already signed in before launching interactive CLI
     if (cliSpec.expectedSource === "agy-cli") {
-      const spin = new TerminalSpinner();
-      spin.start("Checking Google Antigravity (agy) session");
       let agyProbe: { models: unknown[]; ok: boolean; error?: string };
-      try {
-        agyProbe = await probeAgyModels(15000);
-      } finally {
-        spin.stop();
+      if (this.fullScreenActive) {
+        this.startSpinnerFs("Checking Google Antigravity (agy) session");
+        try {
+          agyProbe = await probeAgyModels(15000);
+        } finally {
+          this.stopSpinnerFs();
+        }
+      } else {
+        const spin = new TerminalSpinner();
+        spin.start("Checking Google Antigravity (agy) session");
+        try {
+          agyProbe = await probeAgyModels(15000);
+        } finally {
+          spin.stop();
+        }
       }
       if (agyProbe.ok) {
         const updated = this.engine.connectProvider(provider.id, "agy-cli");
@@ -1361,6 +3415,24 @@ export class YedoguTui {
           keywords: "open browser web key",
         });
       }
+      if (current.custom) {
+        actionOptions.push({
+          value: "edit-custom",
+          label: "Edit Custom Provider Settings",
+          description: `${current.protocol} · ${current.baseUrl}`,
+          badge: "Edit",
+          badgeColor: PALETTE.info,
+          keywords: "edit custom url protocol models",
+        });
+        actionOptions.push({
+          value: "delete-custom",
+          label: "Delete Custom Provider",
+          description: `Remove custom provider "${current.id}"`,
+          badge: "Remove",
+          badgeColor: PALETTE.danger,
+          keywords: "delete remove custom provider",
+        });
+      }
       if (connected) {
         const deleteLabel = isAgyAuth
           ? "Disconnect Antigravity (agy CLI)"
@@ -1418,6 +3490,25 @@ export class YedoguTui {
         const keyOutcome = await promptAndSaveApiKey(current, "esc back");
         if (keyOutcome === "saved") return "done";
         continue;
+      }
+
+      if (methodRes.value === "edit-custom") {
+        const edited = await this.openCustomProviderFormModal(current);
+        if (edited) return "done";
+        continue;
+      }
+
+      if (methodRes.value === "delete-custom") {
+        const conf = await this.runConfirmModal({
+          title: `Delete ${current.name}?`,
+          message: `Remove custom provider "${current.id}" and its credentials?`,
+          confirmLabel: "Delete",
+          danger: true,
+        });
+        if (!conf.confirmed) continue;
+        this.engine.deleteCustomProvider(current.id);
+        this.emitOut(`\n  ${c(PALETTE.success, "✓")} Deleted custom provider ${c(PALETTE.text + PALETTE.bold, current.id)}\n`);
+        return canGoBack ? "back" : "done";
       }
 
       if (methodRes.value === "delete") {
@@ -2053,6 +4144,29 @@ export class YedoguTui {
   // ═══════════════════════════════════════════════════════════════════════════
 
   private async handleSlashCommand(line: string): Promise<boolean> {
+    if (this.fullScreenActive) {
+      const origWrite = process.stdout.write.bind(process.stdout);
+      process.stdout.write = ((chunk: any, ...rest: any[]) => {
+        if (typeof chunk === "string") {
+          if (chunk.startsWith("\x1b]52;") || chunk.startsWith("\x1b[?")) {
+            return origWrite(chunk, ...rest);
+          }
+          this.appendTranscript(chunk);
+          return true;
+        }
+        return origWrite(chunk, ...rest);
+      }) as typeof process.stdout.write;
+      try {
+        return await this.handleSlashCommandInner(line);
+      } finally {
+        process.stdout.write = origWrite;
+        if (this.fullScreenActive) this.render();
+      }
+    }
+    return this.handleSlashCommandInner(line);
+  }
+
+  private async handleSlashCommandInner(line: string): Promise<boolean> {
     const parts = line.split(/\s+/);
     const cmd = parts[0].toLowerCase();
     const args = parts.slice(1);
@@ -2304,6 +4418,24 @@ export class YedoguTui {
         return true;
       }
 
+      case "/effort":
+      case "/reasoning": {
+        const level = (args[0] || "").toLowerCase() as ReasoningEffort;
+        if (["none", "low", "medium", "high", "xhigh"].includes(level)) {
+          const applied = this.engine.setReasoningEffort(level);
+          process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Reasoning effort → ${c(PALETTE.reasoning + PALETTE.bold, applied)}\n`);
+          return true;
+        }
+        if (process.stdout.isTTY) {
+          await this.openReasoningPicker();
+        } else {
+          process.stdout.write(
+            `\n  ${c(PALETTE.muted, `Current effort: ${this.engine.session.reasoningEffort || "medium"} · Usage: /effort <none|low|medium|high|xhigh>`)}\n`,
+          );
+        }
+        return true;
+      }
+
       case "/model":
       case "/models": {
         if (args[0]?.toLowerCase() === "refresh") {
@@ -2314,13 +4446,22 @@ export class YedoguTui {
             );
             return true;
           }
-          const spin = new TerminalSpinner();
-          spin.start("Refreshing live models from connected providers");
           let results: Array<{ providerId: string; count: number; live: boolean; error?: string }> = [];
-          try {
-            results = await this.engine.refreshProviderModels();
-          } finally {
-            spin.stop();
+          if (this.fullScreenActive) {
+            this.startSpinnerFs("Refreshing live models from connected providers");
+            try {
+              results = await this.engine.refreshProviderModels();
+            } finally {
+              this.stopSpinnerFs();
+            }
+          } else {
+            const spin = new TerminalSpinner();
+            spin.start("Refreshing live models from connected providers");
+            try {
+              results = await this.engine.refreshProviderModels();
+            } finally {
+              spin.stop();
+            }
           }
           process.stdout.write("\n");
           for (const r of results) {
@@ -2536,6 +4677,195 @@ export class YedoguTui {
         return true;
       }
 
+      case "/sidebar": {
+        const sub = (args[0] || "").toLowerCase();
+        if (sub === "auto" || sub === "show" || sub === "hide") {
+          this.sidebarMode = sub;
+        } else {
+          this.sidebarMode = this.sidebarMode === "hide" ? "show" : this.sidebarMode === "show" ? "hide" : "show";
+        }
+        const sideLines = renderSidebarPanel(
+          this.engine.session,
+          this.engine.getAgent(),
+          this.engine.getProviders(),
+          this.daemon.url,
+          this.engine.channels.getPublicViews(),
+        );
+        process.stdout.write(
+          `\n  ${c(PALETTE.success, "✓")} Sidebar mode → ${c(PALETTE.text + PALETTE.bold, this.sidebarMode)}\n` +
+            sideLines.map((l) => `  ${c(PALETTE.border, "│")} ${l}`).join("\n") +
+            "\n",
+        );
+        return true;
+      }
+
+      case "/timeline":
+        if (process.stdout.isTTY) {
+          await this.openTimelinePicker();
+        } else {
+          process.stdout.write(`\n  ${c(PALETTE.muted, `${this.engine.session.messages.length} messages in timeline`)}\n`);
+        }
+        return true;
+
+      case "/undo": {
+        if (this.undoStack.length === 0) {
+          process.stdout.write(`\n  ${c(PALETTE.muted, "· Nothing to undo.")}\n`);
+          return true;
+        }
+        this.redoStack.push(structuredClone(this.engine.session.messages));
+        this.engine.session.messages = this.undoStack.pop()!;
+        process.stdout.write(
+          `\n  ${c(PALETTE.success, "✓")} Undid last turn (${this.engine.session.messages.length} messages remaining · /redo to restore)\n`,
+        );
+        return true;
+      }
+
+      case "/redo": {
+        if (this.redoStack.length === 0) {
+          process.stdout.write(`\n  ${c(PALETTE.muted, "· Nothing to redo.")}\n`);
+          return true;
+        }
+        this.undoStack.push(structuredClone(this.engine.session.messages));
+        this.engine.session.messages = this.redoStack.pop()!;
+        process.stdout.write(
+          `\n  ${c(PALETTE.success, "✓")} Restored turn (${this.engine.session.messages.length} messages)\n`,
+        );
+        return true;
+      }
+
+      case "/yank":
+      case "/copy": {
+        const lastAssistant = [...this.engine.session.messages].reverse().find((m) => m.role === "assistant" && m.content.trim());
+        if (!lastAssistant) {
+          process.stdout.write(`\n  ${c(PALETTE.muted, "· No assistant response to copy.")}\n`);
+          return true;
+        }
+        this.copyTextToClipboard(lastAssistant.content);
+        return true;
+      }
+
+      case "/export": {
+        const lines = [
+          `# ${this.engine.session.name || "YEDOGU Session"} (${this.engine.session.id})`,
+          `- Workspace: \`${this.engine.session.workspace}\``,
+          `- Model: \`${this.engine.session.activeModel}\``,
+          `- Exported: ${new Date().toISOString()}`,
+          "",
+          ...this.engine.session.messages.map((m) =>
+            `## ${m.role === "user" ? "User" : `Assistant (@${m.agentId || "commander"})`} — ${m.timestamp}\n\n${m.content}\n`,
+          ),
+        ];
+        const md = lines.join("\n");
+        const outFile = rest
+          ? path.resolve(this.engine.session.workspace, rest)
+          : path.resolve(this.engine.session.workspace, `yedogu-session-${this.engine.session.id}.md`);
+        fs.writeFileSync(outFile, md, "utf8");
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Exported session transcript to ${c(PALETTE.info, outFile)}\n`);
+        return true;
+      }
+
+      case "/editor": {
+        const editorCmd = process.env.VISUAL || process.env.EDITOR || (process.platform === "win32" ? "notepad" : "vi");
+        const tmpFile = path.join(os.tmpdir(), `yedogu-prompt-${Date.now()}.md`);
+        fs.writeFileSync(tmpFile, "", "utf8");
+        const wasRaw = Boolean(process.stdin.isTTY && (process.stdin as any).isRaw);
+        this.rl?.pause();
+        if (wasRaw && typeof process.stdin.setRawMode === "function") {
+          try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+        }
+        try {
+          spawnSync(editorCmd, [tmpFile], { stdio: "inherit", shell: true });
+        } finally {
+          if (wasRaw && typeof process.stdin.setRawMode === "function") {
+            try { process.stdin.setRawMode(true); } catch { /* ignore */ }
+          }
+          this.rl?.resume();
+        }
+        const edited = fs.existsSync(tmpFile) ? fs.readFileSync(tmpFile, "utf8").trim() : "";
+        try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+        if (!edited) {
+          process.stdout.write(`\n  ${c(PALETTE.muted, "· Empty editor buffer; cancelled.")}\n`);
+          return true;
+        }
+        process.stdout.write(`\n  ${c(PALETTE.accent, "❯")} ${c(PALETTE.text, truncatePlain(edited, 80))}\n`);
+        await this.engine.sendPrompt(this.expandAtFileReferences(edited));
+        return true;
+      }
+
+      case "/diff": {
+        const sub = (args[0] || "").toLowerCase();
+        if (sub === "split" || sub === "unified" || sub === "auto") {
+          this.diffViewMode = sub;
+          process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Diff view mode → ${c(PALETTE.text + PALETTE.bold, sub)}\n`);
+        }
+        const mods = this.engine.session.modifiedFiles ?? [];
+        if (mods.length === 0) {
+          process.stdout.write(`\n  ${c(PALETTE.muted, "· No modified files recorded in this session yet.")}\n`);
+          return true;
+        }
+        for (const mf of mods.slice(0, 6)) {
+          process.stdout.write("\n" + renderDiffView(mf.patch, { filePath: mf.path, view: this.diffViewMode }).join("\n") + "\n");
+        }
+        return true;
+      }
+
+      case "/todos": {
+        process.stdout.write("\n" + renderTodoListCard(this.engine.session.todos ?? []).join("\n") + "\n\n");
+        return true;
+      }
+
+      case "/stash": {
+        const sub = (args[0] || "").toLowerCase();
+        this.engine.session.stashedPrompts ??= [];
+        if (sub === "clear") {
+          this.engine.session.stashedPrompts = [];
+          process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Cleared stashed prompts.\n`);
+          return true;
+        }
+        if (sub === "pop") {
+          const popped = this.engine.session.stashedPrompts.shift();
+          process.stdout.write(popped ? `\n  ${c(PALETTE.info, "→")} ${popped}\n` : `\n  ${c(PALETTE.muted, "· Stash is empty.")}\n`);
+          return true;
+        }
+        if (process.stdout.isTTY) {
+          await this.openStashPicker();
+        } else {
+          process.stdout.write(`\n  ${c(PALETTE.muted, `${this.engine.session.stashedPrompts.length} stashed prompts`)}\n`);
+        }
+        return true;
+      }
+
+      case "/settings":
+        if (process.stdout.isTTY) {
+          await this.openSettingsModal();
+        } else {
+          process.stdout.write(`\n  ${c(PALETTE.muted, `sidebar=${this.sidebarMode} · diff=${this.diffViewMode} · theme=${getActiveTheme().id}`)}\n`);
+        }
+        return true;
+
+      case "/mouse":
+        this.toggleMouseCapture();
+        return true;
+
+      case "/rename":
+        if (rest) {
+          this.engine.updateSession(this.engine.session.id, { name: rest });
+          process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Session renamed to ${c(PALETTE.text + PALETTE.bold, rest)}\n`);
+        } else if (process.stdout.isTTY) {
+          await this.renameCurrentSession();
+        }
+        return true;
+
+      case "/fork": {
+        const forkedName = rest || `${this.engine.session.name || "Session"} (fork)`;
+        const snapshot = structuredClone(this.engine.session.messages);
+        const newSess = this.engine.newSession(forkedName);
+        newSess.parentSessionId = this.engine.session.id;
+        newSess.messages = snapshot;
+        process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Forked session into ${c(PALETTE.info, newSess.id)} (${snapshot.length} msgs)\n`);
+        return true;
+      }
+
       case "/new":
         this.engine.newSession(rest || undefined);
         process.stdout.write(`\n  ${c(PALETTE.success, "✓")} Started new session ${c(PALETTE.info, this.engine.session.id)}\n`);
@@ -2547,6 +4877,12 @@ export class YedoguTui {
 
       case "/clear":
         this.engine.clearMessages();
+        if (this.fullScreenActive) {
+          this.transcriptLines = [""];
+          this.scrollOffset = 0;
+          this.screenMode = "home";
+          return true;
+        }
         console.clear();
         process.stdout.write(
           renderBanner(
@@ -2555,6 +4891,7 @@ export class YedoguTui {
             this.engine.getProviders(),
             this.daemon.url,
             this.engine.channels.getPublicViews(),
+            { sidebarMode: this.sidebarMode },
           ),
         );
         return true;
@@ -2587,8 +4924,23 @@ export class YedoguTui {
   }
 
   private async shutdown(): Promise<void> {
+    this.leader.disarm();
+    this.stopSpinnerFs();
     this.activeModal?.close();
-    this.clearDecorations();
+    if (this.fullScreenActive) {
+      this.fullScreenActive = false;
+      if (this.mouseDataListener) process.stdin.off("data", this.mouseDataListener);
+      if (this.keypressListener && this.keyStream) this.keyStream.off("keypress", this.keypressListener);
+      this.keyStream?.end();
+      this.keyStream = null;
+      if (this.resizeListener) process.stdout.off("resize", this.resizeListener);
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+        try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+      }
+      this.screen.leave();
+    } else {
+      this.clearDecorations();
+    }
     this.spinner.stop(true);
     process.stdout.write(c(PALETTE.muted, "\n  Shutting down YEDOGU…\n"));
     this.rl?.close();

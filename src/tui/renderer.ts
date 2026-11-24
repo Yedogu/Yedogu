@@ -21,6 +21,7 @@ import {
   padVisible,
   renderMiniGauge,
   renderThemeSwatch,
+  renderYedoguLogo,
   rule,
   shortenPath,
   termWidth,
@@ -30,6 +31,7 @@ import {
 import {
   renderCallout,
   renderCheckGrid,
+  renderDiffView,
   renderEndpointLine,
   renderGraphFrame,
   renderMeter,
@@ -37,8 +39,11 @@ import {
   renderScoreDots,
   renderSectionHeader,
   renderSeverityStack,
+  renderSidebarPanel,
   renderSpecRows,
+  renderSplitScreen,
   renderStatRow,
+  renderTodoListCard,
   renderTree,
   renderUptimeStrip,
 } from "./components.js";
@@ -55,6 +60,7 @@ export function renderBanner(
   providers: ProviderConfig[],
   daemonUrl: string,
   channels: ChannelPublicView[] = [],
+  options: { sidebarMode?: "auto" | "show" | "hide" } = {},
 ): string {
   const connected = providers.filter(isProviderConnected).map((p) => p.id);
   const effectiveModel = session.agentModels[agent.id] || session.activeModel;
@@ -62,6 +68,12 @@ export function renderBanner(
   const high = session.findings.filter((f) => f.severity === "high").length;
   const med = session.findings.filter((f) => f.severity === "medium").length;
   const theme = getActiveTheme();
+  const cols = process.stdout.columns || 88;
+  const sidebarMode = options.sidebarMode ?? "auto";
+  const showSidebar =
+    sidebarMode === "show" || (sidebarMode === "auto" && cols > 120 && !session.parentSessionId);
+  const sidebarW = 42;
+  const mainCols = showSidebar ? Math.max(54, cols - sidebarW - 5) : cols;
 
   const scopeBadge =
     session.scope.mode === "enforced"
@@ -80,8 +92,8 @@ export function renderBanner(
     ? `${c(PALETTE.success, connected.slice(0, 3).join(", "))}${connected.length > 3 ? c(PALETTE.muted, ` +${connected.length - 3}`) : ""}  ${providerUptime}`
     : `${c(PALETTE.warning, "none (/connect)")}  ${providerUptime}`;
 
-  const cardWidth = termWidth(80, 58);
-  const specWidth = Math.max(44, cardWidth - 6);
+  const cardWidth = Math.max(54, Math.min(75, mainCols - 4));
+  const specWidth = Math.max(42, cardWidth - 6);
 
   const specRows = [
     {
@@ -126,21 +138,29 @@ export function renderBanner(
   const frame = renderGraphFrame(cardLines, {
     title: "YEDOGU v1.0.0",
     rightMeta: c(PALETTE.muted, session.id),
-    footer: c(PALETTE.muted, "^K palette · ^P model · ^G agent · ^T theme · ^B browser"),
+    footer: c(PALETTE.muted, "^P/^K palette · ^X leader · S-Tab agent · F2 model · ^B browser"),
     frame: "box",
     width: cardWidth,
     indent: "  ",
   });
 
   const hint = connected.length
-    ? `  ${c(PALETTE.muted, "Type")} ${c(PALETTE.text, "/")} ${c(PALETTE.muted, "commands ·")} ${c(PALETTE.text, "@")} ${c(PALETTE.muted, "route agent ·")} ${c(PALETTE.text, "?")} ${c(PALETTE.muted, "keys ·")} ${c(PALETTE.text, "Ctrl+K")} ${c(PALETTE.muted, "palette")}`
-    : `  ${c(PALETTE.accentSoft, "Tip:")} ${c(PALETTE.secondary, "Run")} ${c(PALETTE.text, "/connect")} ${c(PALETTE.secondary, "or press")} ${c(PALETTE.text, "Ctrl+K")} ${c(PALETTE.secondary, "to add an API key.")}`;
+    ? `  ${c(PALETTE.muted, "Type")} ${c(PALETTE.text, "/")} ${c(PALETTE.muted, "commands ·")} ${c(PALETTE.text, "@")} ${c(PALETTE.muted, "file/agent ·")} ${c(PALETTE.text, "!")} ${c(PALETTE.muted, "shell ·")} ${c(PALETTE.text, "^X")} ${c(PALETTE.muted, "leader ·")} ${c(PALETTE.text, "^P")} ${c(PALETTE.muted, "palette")}`
+    : `  ${c(PALETTE.accentSoft, "Tip:")} ${c(PALETTE.secondary, "Run")} ${c(PALETTE.text, "/connect")} ${c(PALETTE.secondary, "or press")} ${c(PALETTE.text, "Ctrl+P")} ${c(PALETTE.secondary, "to add an API key.")}`;
 
-  return `\n${frame}\n\n${hint}\n`;
+  const logoBlock = renderYedoguLogo(cardWidth, true);
+  const mainColumn = `\n${logoBlock}\n\n${frame}\n\n${hint}\n`;
+
+  if (showSidebar) {
+    const sidebarLines = renderSidebarPanel(session, agent, providers, daemonUrl, channels, sidebarW);
+    return `\n${renderSplitScreen(mainColumn.split("\n"), sidebarLines, cols, sidebarW)}\n`;
+  }
+
+  return mainColumn;
 }
 
 /**
- * Calm, single-line context bar printed above the minimal composer.
+ * OpenCode-style left-accent-border context header rail above the prompt.
  */
 export function renderContextBar(session: SessionData): string {
   const effectiveModel = session.agentModels[session.activeAgent] || session.activeModel;
@@ -156,31 +176,38 @@ export function renderContextBar(session: SessionData): string {
     c(PALETTE.secondary, shortModel),
     scopeDot,
   ];
+  if (session.reasoningEffort && session.reasoningEffort !== "none") {
+    parts.push(c(PALETTE.reasoning, session.reasoningEffort));
+  }
   if (session.findings.length > 0) {
     parts.push(c(PALETTE.warning, `⚑ ${session.findings.length}`));
+  }
+  if ((session.todos?.length ?? 0) > 0) {
+    const done = session.todos!.filter((t) => t.status === "completed").length;
+    parts.push(c(PALETTE.info, `☑ ${done}/${session.todos!.length}`));
   }
   if (totalTok > 0) {
     parts.push(`${renderMiniGauge(totalTok)} ${c(PALETTE.muted, `${formatTokens(totalTok)}`)}`);
   }
 
   const sep = c(PALETTE.border, " · ");
-  const width = termWidth(80, 58);
-  return `\n  ${rule(width, undefined, true)}\n  ${parts.join(sep)}\n`;
+  const rail = c(PALETTE.accent, "┃");
+  return `\n  ${rail} ${parts.join(sep)}\n`;
 }
 
 /**
  * Ultra-quiet single-line shortcut bar drawn below the prompt when idle.
  */
 export function renderComposerFooter(): string {
-  const width = termWidth(80, 58);
+  const width = termWidth(88, 58);
   const items = [
-    `${c(PALETTE.secondary, "^K")} ${c(PALETTE.muted, "palette")}`,
-    `${c(PALETTE.secondary, "^P")} ${c(PALETTE.muted, "model")}`,
-    `${c(PALETTE.secondary, "^G")} ${c(PALETTE.muted, "agent")}`,
-    `${c(PALETTE.secondary, "^T")} ${c(PALETTE.muted, "theme")}`,
-    `${c(PALETTE.secondary, "^O")} ${c(PALETTE.muted, "sessions")}`,
-    `${c(PALETTE.secondary, "/")} ${c(PALETTE.muted, "commands")}`,
-    `${c(PALETTE.secondary, "@")} ${c(PALETTE.muted, "route")}`,
+    `${c(PALETTE.secondary, "^P")} ${c(PALETTE.muted, "palette")}`,
+    `${c(PALETTE.secondary, "^X")} ${c(PALETTE.muted, "leader")}`,
+    `${c(PALETTE.secondary, "S-Tab")} ${c(PALETTE.muted, "agent")}`,
+    `${c(PALETTE.secondary, "F2")} ${c(PALETTE.muted, "model")}`,
+    `${c(PALETTE.secondary, "!")} ${c(PALETTE.muted, "shell")}`,
+    `${c(PALETTE.secondary, "/")} ${c(PALETTE.muted, "cmds")}`,
+    `${c(PALETTE.secondary, "@")} ${c(PALETTE.muted, "file/agent")}`,
   ];
   const sep = "  ";
   let line = "";
@@ -193,10 +220,10 @@ export function renderComposerFooter(): string {
 }
 
 /**
- * Clean, uncluttered prompt glyph.
+ * OpenCode left-accent-border prompt glyph (`┃ ❯ `).
  */
 export function renderPromptString(_session: SessionData): string {
-  return `  ${c(PALETTE.accent + PALETTE.bold, "❯")} `;
+  return `  ${c(PALETTE.accent, "┃")} ${c(PALETTE.accent + PALETTE.bold, "❯")} `;
 }
 
 /**
@@ -223,8 +250,25 @@ export function formatToolArgsCompact(args: Record<string, unknown>, maxLen = 64
 export function renderToolStart(name: string, args: Record<string, unknown>, stepNum?: number): string {
   const compact = formatToolArgsCompact(args);
   const stepTag = stepNum !== undefined ? `${c(PALETTE.muted, String(stepNum).padStart(2, "0"))} ` : "";
+  const iconMap: Record<string, string> = {
+    pty_exec: "$",
+    shell: "$",
+    fs_read: "→",
+    fs_glob: "✱",
+    fs_grep: "✱",
+    fs_edit: "←",
+    fs_write: "←",
+    todo_write: "⚙",
+    swarm_dispatch: "│",
+    http_forge: "⇄",
+    binary_triage: "◈",
+    js_recon: "◈",
+    finding_record: "⚑",
+    mcp_call: "◇",
+  };
+  const glyph = iconMap[name] ?? "$";
   const argPart = compact ? `${c(PALETTE.muted, "(")}${c(PALETTE.secondary, compact)}${c(PALETTE.muted, ")")}` : "";
-  return `\n  ${stepTag}${c(PALETTE.accent, "$")} ${c(PALETTE.text + PALETTE.bold, name)}${argPart}\n`;
+  return `\n  ${stepTag}${c(PALETTE.accent, glyph)} ${c(PALETTE.text + PALETTE.bold, name)}${argPart}\n`;
 }
 
 export function renderToolDone(
@@ -232,7 +276,38 @@ export function renderToolDone(
   ok: boolean,
   durationMs: number,
   output?: string,
+  diffViewMode: "auto" | "unified" | "split" = "auto",
 ): string {
+  // Specialized OpenCode diff card for fs_edit
+  if (ok && name === "fs_edit" && output && output.includes("@@")) {
+    const diffLines = renderDiffView(output, { view: diffViewMode });
+    return `${diffLines.join("\n")}\n    ${c(PALETTE.border, "⎿")}  ${c(PALETTE.success, "✓")} ${c(PALETTE.muted, `${durationMs}ms`)}\n`;
+  }
+
+  // Specialized OpenCode # Todos card for todo_write
+  if (ok && name === "todo_write" && output) {
+    const jsonLine = output.split(/\r?\n/).find((l) => l.trim().startsWith("["));
+    if (jsonLine) {
+      try {
+        const todos = JSON.parse(jsonLine);
+        if (Array.isArray(todos)) {
+          return `${renderTodoListCard(todos).join("\n")}\n`;
+        }
+      } catch {
+        // fallback to standard summary
+      }
+    }
+  }
+
+  // Specialized OpenCode shell output preview for pty_exec / shell
+  if ((name === "pty_exec" || name === "shell") && output) {
+    const lines = output.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const preview = lines.slice(0, 6).map((l) => `    ${c(PALETTE.border, "│")} ${c(PALETTE.secondary, truncatePlain(l, termWidth(84, 56) - 8))}`);
+    const extra = lines.length > 6 ? `\n    ${c(PALETTE.border, "│")} ${c(PALETTE.muted, `… ${lines.length - 6} more lines`)}` : "";
+    const icon = ok ? c(PALETTE.success, "✓") : c(PALETTE.danger, "×");
+    return `${preview.join("\n")}${extra}\n    ${c(PALETTE.border, "⎿")}  ${icon} ${c(PALETTE.muted, `${durationMs}ms`)}\n`;
+  }
+
   const firstLine = (output || "")
     .split(/\r?\n/)
     .map((l) => l.trim())
