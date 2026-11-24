@@ -13,6 +13,7 @@
 </p>
 
 <p>
+  <a href="https://github.com/Yedogu/Yedogu"><img src="https://img.shields.io/github/stars/Yedogu/Yedogu?style=flat-square&logo=github&label=Star%20us" alt="GitHub Stars"></a>
   <img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=flat-square&logo=node.js&logoColor=white" alt="Node.js >= 20">
   <img src="https://img.shields.io/badge/TypeScript-5.7-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript">
   <img src="https://img.shields.io/badge/Agents-8_Specialists-22c55e?style=flat-square" alt="8 Specialist Agents">
@@ -121,6 +122,8 @@ Yedogu/
 <div align="center">
 
 <img src="./logos/yedogulogo.png" alt="Yedogu Icon" width="56">
+
+<p>If you find Yedogu useful, consider <a href="https://github.com/Yedogu/Yedogu">starring the repository on GitHub</a>.</p>
 
 <p><sub>Built for authorized offensive security research, bug bounty hunting, and reverse engineering.</sub></p>
 
