@@ -68,7 +68,7 @@
 ## Quick Start
 
 ```bash
-git clone https://github.com/swarnimbandekar/Yedogu.git
+git clone https://github.com/Yedogu/Yedogu.git
 cd Yedogu
 npm install
 npm run build
